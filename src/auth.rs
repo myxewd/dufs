@@ -369,29 +369,7 @@ impl AccessPaths {
         prefix: &[&str],
         root: Option<&Path>,
     ) -> Option<&'a AccessPaths> {
-        let root = root?;
-        // Cheap pre-filter: without a plausible alias there is no need to touch
-        // the filesystem at all, so precise requests stay on the fast path.
-        if !self.children.keys().any(|key| could_alias(name, key)) {
-            return None;
-        }
-        let name_ident = path_identity(root, prefix, name).await?;
-        // The identity exposes the on-disk spelling of `name`, so children that
-        // could not spell it can be skipped without a lookup of their own, which
-        // bounds the number of lookups however many children a rule has.
-        let real_name = name_ident.file_name().and_then(|v| v.to_str());
-        for (key, child) in &self.children {
-            if real_name.is_some_and(|real| !could_alias(real, key)) {
-                continue;
-            }
-            if path_identity(root, prefix, key)
-                .await
-                .is_some_and(|v| v == name_ident)
-            {
-                return Some(child);
-            }
-        }
-        None
+        find_child_alias(&self.children, name, prefix, root).await
     }
 
     pub fn child_names(&self) -> Vec<&String> {
@@ -417,6 +395,43 @@ impl AccessPaths {
             }
         }
     }
+}
+
+/// Find a configured child whose name the backing filesystem resolves to the
+/// same object as `name` under `prefix` (a path relative to `root`).
+///
+/// This is shared by the auth permission tree and the ip whitelist tree so that
+/// both treat filesystem aliases (case variants, NTFS 8.3 short names, ...)
+/// consistently.
+pub(crate) async fn find_child_alias<'a, T>(
+    children: &'a IndexMap<String, T>,
+    name: &str,
+    prefix: &[&str],
+    root: Option<&Path>,
+) -> Option<&'a T> {
+    let root = root?;
+    // Cheap pre-filter: without a plausible alias there is no need to touch
+    // the filesystem at all, so precise requests stay on the fast path.
+    if !children.keys().any(|key| could_alias(name, key)) {
+        return None;
+    }
+    let name_ident = path_identity(root, prefix, name).await?;
+    // The identity exposes the on-disk spelling of `name`, so children that
+    // could not spell it can be skipped without a lookup of their own, which
+    // bounds the number of lookups however many children a rule has.
+    let real_name = name_ident.file_name().and_then(|v| v.to_str());
+    for (key, child) in children {
+        if real_name.is_some_and(|real| !could_alias(real, key)) {
+            continue;
+        }
+        if path_identity(root, prefix, key)
+            .await
+            .is_some_and(|v| v == name_ident)
+        {
+            return Some(child);
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]

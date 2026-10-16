@@ -62,6 +62,7 @@ const ICONS = {
   edit: `<svg width="16" height="16" viewBox="0 0 16 16"><path d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168l10-10zM11.207 2.5 13.5 4.793 14.793 3.5 12.5 1.207 11.207 2.5zm1.586 3L10.5 3.207 4 9.707V10h.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.5h.293l6.5-6.5zm-9.761 5.175-.106.106-1.528 3.821 3.821-1.528.106-.106A.5.5 0 0 1 5 12.5V12h-.5a.5.5 0 0 1-.5-.5V11h-.5a.5.5 0 0 1-.468-.325z"/></svg>`,
   delete: `<svg width="16" height="16" viewBox="0 0 16 16"><path d="M6.854 7.146a.5.5 0 1 0-.708.708L7.293 9l-1.147 1.146a.5.5 0 0 0 .708.708L8 9.707l1.146 1.147a.5.5 0 0 0 .708-.708L8.707 9l1.147-1.146a.5.5 0 0 0-.708-.708L8 8.293 6.854 7.146z"/><path d="M14 14V4.5L9.5 0H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2zM9.5 3A1.5 1.5 0 0 0 11 4.5h2V14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1h5.5v2z"/></svg>`,
   view: `<svg width="16" height="16" viewBox="0 0 16 16"><path d="M4 0a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V2a2 2 0 0 0-2-2zm0 1h8a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1"/></svg>`,
+  shield: `<svg width="16" height="16" viewBox="0 0 16 16"><path d="M8 0c-.7 1.3-2.2 2.1-4 2.1v5c0 3.2 1.9 6 4 6.9 2.1-.9 4-3.7 4-6.9v-5C10.2 2.1 8.7 1.3 8 0zm0 1.6c.9.6 1.9 1 3 1.2v4.8c0 2.2-1.2 4.2-3 5.3-1.8-1.1-3-3.1-3-5.3V2.8c1.1-.2 2.1-.6 3-1.2z"/></svg>`,
 }
 
 /**
@@ -441,6 +442,10 @@ async function setupIndexPage() {
     setupSearch();
   }
 
+  if (DATA.allow_ip_whitelist) {
+    setupIpWhitelist();
+  }
+
   renderPathsTableHead();
   renderPathsTableBody();
 
@@ -487,6 +492,7 @@ function renderPathsTableHead() {
     const icon = `<span>${svg}</span>`
     return `<th class="cell-${item.name}" ${item.props}><a href="?${qs}">${item.text}${icon}</a></th>`
   }).join("\n")}
+      ${DATA.allow_ip_whitelist ? `<th class="cell-whitelist">Whitelist</th>` : ""}
       <th class="cell-actions">Actions</th>
     </tr>
   `);
@@ -523,6 +529,7 @@ function addPath(file, index) {
   let actionMove = "";
   let actionEdit = "";
   let actionView = "";
+  let actionWhitelist = "";
   let isDir = file.path_type.endsWith("Dir");
   if (isDir) {
     url += "/";
@@ -551,6 +558,9 @@ function addPath(file, index) {
   if (!actionEdit && !isDir) {
     actionView = `<a class="action-btn" title="View file" target="_blank" href="${url}?view">${ICONS.view}</a>`;
   }
+  if (DATA.allow_ip_whitelist) {
+    actionWhitelist = `<div onclick="manageWhitelist(${index})" class="action-btn" title="IP whitelist">${ICONS.shield}</div>`;
+  }
   let actionCell = `
   <td class="cell-actions">
     ${actionDownload}
@@ -558,6 +568,7 @@ function addPath(file, index) {
     ${actionMove}
     ${actionDelete}
     ${actionEdit}
+    ${actionWhitelist}
   </td>`;
 
   let sizeDisplay = isDir ? formatDirSize(file.size) : formatFileSize(file.size).join(" ");
@@ -572,6 +583,7 @@ function addPath(file, index) {
   </td>
   <td class="cell-mtime">${formatMtime(file.mtime)}</td>
   <td class="cell-size">${sizeDisplay}</td>
+  ${DATA.allow_ip_whitelist ? `<td class="cell-whitelist">${whitelistCell(file.whitelist)}</td>` : ""}
   ${actionCell}
 </tr>`);
 }
@@ -687,6 +699,127 @@ function setupNewFile() {
     const name = prompt("Enter file name");
     if (name) createFile(name);
   });
+}
+
+var WHITELIST_RULES = {};
+var WHITELIST_PATH = "";
+
+function setupIpWhitelist() {
+  const $modal = document.getElementById("whitelistModal");
+  const $btn = document.querySelector(".ip-whitelist-btn");
+  $btn.classList.remove("hidden");
+  $btn.addEventListener("click", () => openWhitelistModal(currentDirPath()));
+  $modal.querySelector(".modal-close").addEventListener("click", () => $modal.classList.add("hidden"));
+  $modal.addEventListener("click", e => {
+    if (e.target === $modal) $modal.classList.add("hidden");
+  });
+  $modal.querySelector(".save-rule-btn").addEventListener("click", saveWhitelist);
+  $modal.querySelector(".remove-rule-btn").addEventListener("click", removeWhitelist);
+}
+
+function currentDirPath() {
+  return DATA.href === "/" ? "/" : DATA.href;
+}
+
+function whitelistUrl() {
+  return DATA.uri_prefix + "__dufs__/ip-whitelist";
+}
+
+async function openWhitelistModal(path) {
+  const $modal = document.getElementById("whitelistModal");
+  $modal.querySelector(".modal-status").textContent = "";
+  $modal.classList.remove("hidden");
+  $modal.querySelector(".whitelist-path").textContent = path;
+  const $input = $modal.querySelector(".whitelist-input");
+  $input.value = "";
+  try {
+    const res = await fetch(whitelistUrl() + "?path=" + encodeURIComponent(path));
+    await assertResOK(res);
+    const data = await res.json();
+    WHITELIST_RULES = data.rules || {};
+    WHITELIST_PATH = path;
+    $input.value = initialWhitelistInput(path, WHITELIST_RULES, data.effective);
+    $input.focus();
+  } catch (err) {
+    $modal.classList.add("hidden");
+    alert(`Failed to load ip whitelist, ${err.message}`);
+  }
+}
+
+// Pre-fill the editor with the whitelist that currently applies to the path.
+// A path without a rule of its own is unrestricted, which is shown as 0.0.0.0/0,
+// so an empty input always means "blocked".
+function initialWhitelistInput(path, rules, effective) {
+  if (Object.prototype.hasOwnProperty.call(rules, path)) {
+    return (rules[path] || []).join(", ");
+  }
+  if (effective === null || effective === undefined) {
+    return "0.0.0.0/0";
+  }
+  return effective.join(", ");
+}
+
+function parseWhitelistInput(value) {
+  return value
+    .split(",")
+    .map(v => v.trim())
+    .filter(v => v.length > 0);
+}
+
+async function putWhitelist(rules) {
+  const res = await fetch(whitelistUrl(), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ version: 1, rules }),
+  });
+  await assertResOK(res);
+}
+
+function whitelistCell(value) {
+  if (value === "blocked") {
+    return `<span class="whitelist-blocked">blocked</span>`;
+  }
+  return encodedStr(value || "");
+}
+
+async function saveWhitelist() {
+  const $modal = document.getElementById("whitelistModal");
+  const $status = $modal.querySelector(".modal-status");
+  const ips = parseWhitelistInput($modal.querySelector(".whitelist-input").value);
+  const rules = { ...WHITELIST_RULES };
+  rules[WHITELIST_PATH] = ips;
+  $status.textContent = "Saving...";
+  try {
+    await putWhitelist(rules);
+    $status.textContent = "Saved";
+    location.reload();
+  } catch (err) {
+    $status.textContent = "";
+    alert(`Failed to save ip whitelist, ${err.message}`);
+  }
+}
+
+async function removeWhitelist() {
+  const $modal = document.getElementById("whitelistModal");
+  const $status = $modal.querySelector(".modal-status");
+  const rules = { ...WHITELIST_RULES };
+  delete rules[WHITELIST_PATH];
+  $status.textContent = "Saving...";
+  try {
+    await putWhitelist(rules);
+    $status.textContent = "Saved";
+    location.reload();
+  } catch (err) {
+    $status.textContent = "";
+    alert(`Failed to remove ip whitelist rule, ${err.message}`);
+  }
+}
+
+function manageWhitelist(index) {
+  const file = DATA.paths[index];
+  if (!file) return;
+  const base = DATA.href === "/" ? "/" : DATA.href + "/";
+  openWhitelistModal(base + file.name);
 }
 
 async function setupEditorPage() {

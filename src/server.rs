@@ -2,6 +2,8 @@
 
 use crate::auth::{www_authenticate, AccessPaths, AccessPerm};
 use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
+use crate::ip_whitelist::{IpNet, IpWhitelist};
+use crate::ip_whitelist_store;
 use crate::noscript::{detect_noscript, generate_noscript_html};
 use crate::utils::{
     decode_uri, encode_uri, get_file_name, glob, join_within, parse_range, try_get_file_name,
@@ -36,10 +38,10 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::Metadata;
 use std::io::SeekFrom;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
 use std::sync::atomic::{self, AtomicBool};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite};
 use tokio::{fs, io};
@@ -61,6 +63,7 @@ const BUF_SIZE: usize = 65536;
 const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
 const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
+const IP_WHITELIST_API_PATH: &str = "__dufs__/ip-whitelist";
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
 
 pub struct Server {
@@ -68,12 +71,22 @@ pub struct Server {
     assets_prefix: String,
     html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
+    ip_whitelist: RwLock<Arc<IpWhitelist>>,
     running: Arc<AtomicBool>,
 }
 
 impl Server {
-    pub fn init(args: Args, running: Arc<AtomicBool>) -> Result<Self> {
-        let assets_prefix = format!("__dufs_v{}__/", env!("CARGO_PKG_VERSION"));
+    pub fn init(mut args: Args, running: Arc<AtomicBool>) -> Result<Self> {
+        // Include a hash of the embedded assets so browsers pick up a changed
+        // index.js/index.css even when the crate version did not change.
+        let assets_hash = {
+            let mut hasher = Sha256::new();
+            hasher.update(INDEX_HTML.as_bytes());
+            hasher.update(INDEX_CSS.as_bytes());
+            hasher.update(INDEX_JS.as_bytes());
+            hex::encode(&hasher.finalize()[..4])
+        };
+        let assets_prefix = format!("__dufs_v{}_{}__/", env!("CARGO_PKG_VERSION"), assets_hash);
         let single_file_req_paths = if args.path_is_file {
             vec![
                 args.uri_prefix.to_string(),
@@ -91,12 +104,39 @@ impl Server {
             Some(path) => Cow::Owned(std::fs::read_to_string(path.join("index.html"))?),
             None => Cow::Borrowed(INDEX_HTML),
         };
+
+        if !args
+            .hidden
+            .iter()
+            .any(|v| v == ip_whitelist_store::METADATA_DIR)
+        {
+            args.hidden
+                .push(ip_whitelist_store::METADATA_DIR.to_string());
+        }
+
+        // A persisted store is authoritative. When management is enabled and no
+        // store exists yet, the --ip-whitelist rules seed it so the WebUI can edit
+        // them. A CLI-only run keeps the rules in memory instead.
+        let ip_whitelist = if args.path_is_file {
+            Arc::new(IpWhitelist::default())
+        } else if ip_whitelist_store::exists(&args.serve_path) {
+            Arc::new(ip_whitelist_store::load(&args.serve_path)?)
+        } else {
+            if args.allow_ip_whitelist && !args.ip_whitelist.is_empty() {
+                if let Err(err) = ip_whitelist_store::save(&args.serve_path, &args.ip_whitelist) {
+                    warn!("Failed to persist the --ip-whitelist rules, {err}");
+                }
+            }
+            Arc::new(args.ip_whitelist.clone())
+        };
+
         Ok(Self {
             args,
             running,
             single_file_req_paths,
             assets_prefix,
             html,
+            ip_whitelist: RwLock::new(ip_whitelist),
         })
     }
 
@@ -109,11 +149,12 @@ impl Server {
         let assets_prefix = &self.assets_prefix;
         let enable_cors = self.args.enable_cors;
         let mut http_log_data = self.args.http_logger.data(&req);
+        let client_ip = addr.map(|addr| addr.ip());
         if let Some(addr) = addr {
             http_log_data.insert("remote_addr".to_string(), addr.ip().to_string());
         }
 
-        let mut res = match self.clone().handle(req).await {
+        let mut res = match self.clone().handle(req, client_ip).await {
             Ok(res) => {
                 http_log_data.insert("status".to_string(), res.status().as_u16().to_string());
                 if !uri.path().starts_with(assets_prefix) {
@@ -139,14 +180,13 @@ impl Server {
         Ok(res)
     }
 
-    pub async fn handle(self: Arc<Self>, req: Request) -> Result<Response> {
+    pub async fn handle(self: Arc<Self>, req: Request, ip: Option<IpAddr>) -> Result<Response> {
         let mut res = Response::default();
 
-        let req_path = req.uri().path();
-        let headers = req.headers();
+        let req_path = req.uri().path().to_string();
         let method = req.method().clone();
 
-        let relative_path = match self.resolve_path(req_path) {
+        let relative_path = match self.resolve_path(&req_path) {
             Some(v) => v,
             None => {
                 status_bad_request(&mut res, "Invalid Path");
@@ -154,13 +194,36 @@ impl Server {
             }
         };
 
+        // The metadata directory is never served.
+        if relative_path == ip_whitelist_store::METADATA_DIR
+            || relative_path.starts_with(&format!("{}/", ip_whitelist_store::METADATA_DIR))
+        {
+            status_not_found(&mut res);
+            return Ok(res);
+        }
+
         if (method == Method::GET || method == Method::HEAD)
             && self
-                .handle_internal(&relative_path, method == Method::HEAD, headers, &mut res)
+                .handle_internal(
+                    &relative_path,
+                    method == Method::HEAD,
+                    req.headers(),
+                    &mut res,
+                )
                 .await?
         {
             return Ok(res);
         }
+
+        let ip_ok = self.ip_allowed(&relative_path, ip).await;
+
+        // The management API is guarded by authentication rather than the ip
+        // whitelist, so an administrator is never locked out of fixing a rule.
+        if relative_path == IP_WHITELIST_API_PATH {
+            return self.handle_ip_whitelist(req, method).await;
+        }
+
+        let headers = req.headers();
 
         let user_agent = headers
             .get("user-agent")
@@ -208,6 +271,12 @@ impl Server {
             (x, Some(y)) => (x, y),
         };
 
+        let is_manager = self.args.allow_ip_whitelist && access_paths.perm().readwrite();
+        if !ip_ok && !is_manager {
+            status_forbid(&mut res);
+            return Ok(res);
+        }
+
         if detect_noscript(&user_agent) {
             query_params.insert("noscript".to_string(), String::new());
         }
@@ -249,7 +318,7 @@ impl Server {
             if self
                 .single_file_req_paths
                 .iter()
-                .any(|v| v.as_str() == req_path)
+                .any(|v| v.as_str() == req_path.as_str())
             {
                 self.handle_send_file(&self.args.serve_path, headers, head_only, &mut res)
                     .await?;
@@ -274,6 +343,19 @@ impl Server {
             None => (true, false, false, 0),
         };
 
+        if !ip_ok {
+            // A manager may browse directories to configure their rules, but
+            // still may not read file contents or write on a denied path.
+            let can_list = (method == Method::GET || method == Method::HEAD)
+                && is_dir
+                && !has_query_flag(&query_params, "zip");
+            let can_meta = method == Method::OPTIONS || method.as_str() == "PROPFIND";
+            if !(can_list || can_meta) {
+                status_forbid(&mut res);
+                return Ok(res);
+            }
+        }
+
         let allow_upload = self.args.allow_upload;
         let allow_delete = self.args.allow_delete;
         let allow_search = self.args.allow_search;
@@ -282,7 +364,9 @@ impl Server {
         let render_spa = self.args.render_spa;
         let render_try_index = self.args.render_try_index;
 
-        if self.guard_root_contained(path).await {
+        if self.guard_root_contained(path).await
+            || (self.args.allow_symlink && self.guard_metadata_contained(path).await)
+        {
             self.handle_not_found(&query_params, head_only, &mut res)
                 .await?;
             return Ok(res);
@@ -298,7 +382,7 @@ impl Server {
                                     .await?;
                                 return Ok(res);
                             }
-                            self.handle_zip_dir(path, head_only, access_paths, &mut res)
+                            self.handle_zip_dir(path, head_only, access_paths, ip, &mut res)
                                 .await?;
                         } else if allow_search && query_params.contains_key("q") {
                             self.handle_search_dir(
@@ -307,6 +391,7 @@ impl Server {
                                 head_only,
                                 user,
                                 access_paths,
+                                ip,
                                 &mut res,
                             )
                             .await?;
@@ -318,6 +403,7 @@ impl Server {
                                 head_only,
                                 user,
                                 access_paths,
+                                ip,
                                 &mut res,
                             )
                             .await?;
@@ -330,6 +416,7 @@ impl Server {
                             head_only,
                             user,
                             access_paths,
+                            ip,
                             &mut res,
                         )
                         .await?;
@@ -338,7 +425,7 @@ impl Server {
                             status_not_found(&mut res);
                             return Ok(res);
                         }
-                        self.handle_zip_dir(path, head_only, access_paths, &mut res)
+                        self.handle_zip_dir(path, head_only, access_paths, ip, &mut res)
                             .await?;
                     } else if allow_search && query_params.contains_key("q") {
                         self.handle_search_dir(
@@ -347,6 +434,7 @@ impl Server {
                             head_only,
                             user,
                             access_paths,
+                            ip,
                             &mut res,
                         )
                         .await?;
@@ -358,6 +446,7 @@ impl Server {
                             head_only,
                             user,
                             access_paths,
+                            ip,
                             &mut res,
                         )
                         .await?;
@@ -382,7 +471,7 @@ impl Server {
                             .await?;
                     }
                 } else if render_spa {
-                    self.handle_render_spa(path, &query_params, headers, head_only, &mut res)
+                    self.handle_render_spa(path, &query_params, headers, head_only, ip, &mut res)
                         .await?;
                 } else if allow_upload && req_path.ends_with('/') {
                     self.handle_ls_dir(
@@ -392,6 +481,7 @@ impl Server {
                         head_only,
                         user,
                         access_paths,
+                        ip,
                         &mut res,
                     )
                     .await?;
@@ -457,7 +547,7 @@ impl Server {
                             } else {
                                 access_paths
                             };
-                        self.handle_propfind_dir(path, headers, access_paths, &mut res)
+                        self.handle_propfind_dir(path, headers, access_paths, ip, &mut res)
                             .await?;
                     } else if is_file {
                         self.handle_propfind_file(path, &mut res).await?;
@@ -467,7 +557,7 @@ impl Server {
                 }
                 "PROPPATCH" => {
                     if is_file {
-                        self.handle_proppatch(req_path, &mut res).await?;
+                        self.handle_proppatch(&req_path, &mut res).await?;
                     } else {
                         status_not_found(&mut res);
                     }
@@ -488,7 +578,7 @@ impl Server {
                     } else if is_miss {
                         status_not_found(&mut res);
                     } else {
-                        self.handle_copy(path, &req, &mut res).await?
+                        self.handle_copy(path, &req, ip, &mut res).await?
                     }
                 }
                 "MOVE" => {
@@ -497,14 +587,14 @@ impl Server {
                     } else if is_miss {
                         status_not_found(&mut res);
                     } else {
-                        self.handle_move(path, &req, &mut res).await?
+                        self.handle_move(path, &req, ip, &mut res).await?
                     }
                 }
                 "LOCK" => {
                     // Fake lock
                     if is_file {
                         let has_auth = authorization.is_some();
-                        self.handle_lock(req_path, has_auth, &mut res).await?;
+                        self.handle_lock(&req_path, has_auth, &mut res).await?;
                     } else {
                         status_not_found(&mut res);
                     }
@@ -586,11 +676,16 @@ impl Server {
         head_only: bool,
         user: Option<String>,
         access_paths: AccessPaths,
+        ip: Option<IpAddr>,
         res: &mut Response,
     ) -> Result<()> {
+        let show_all = self.args.allow_ip_whitelist && access_paths.perm().readwrite();
         let mut paths = vec![];
         if !head_only && exist {
-            paths = match self.list_dir(path, path, access_paths.clone()).await {
+            paths = match self
+                .list_dir(path, path, access_paths.clone(), ip, show_all)
+                .await
+            {
                 Ok(paths) => paths,
                 Err(_) => {
                     status_forbid(res);
@@ -617,8 +712,10 @@ impl Server {
         head_only: bool,
         user: Option<String>,
         access_paths: AccessPaths,
+        ip: Option<IpAddr>,
         res: &mut Response,
     ) -> Result<()> {
+        let show_all = self.args.allow_ip_whitelist && access_paths.perm().readwrite();
         let mut paths: Vec<PathItem> = vec![];
         let search = query_params
             .get("q")
@@ -626,7 +723,16 @@ impl Server {
             .to_lowercase();
         if search.is_empty() {
             return self
-                .handle_ls_dir(path, true, query_params, head_only, user, access_paths, res)
+                .handle_ls_dir(
+                    path,
+                    true,
+                    query_params,
+                    head_only,
+                    user,
+                    access_paths,
+                    ip,
+                    res,
+                )
                 .await;
         }
 
@@ -637,6 +743,9 @@ impl Server {
 
             let search_paths = tokio::spawn(collect_dir_entries(
                 access_paths.clone(),
+                self.whitelist_snapshot(),
+                ip,
+                show_all,
                 self.running.clone(),
                 path_buf,
                 hidden,
@@ -669,6 +778,7 @@ impl Server {
         path: &Path,
         head_only: bool,
         access_paths: AccessPaths,
+        ip: Option<IpAddr>,
         res: &mut Response,
     ) -> Result<()> {
         let (mut writer, reader) = tokio::io::duplex(BUF_SIZE);
@@ -685,11 +795,14 @@ impl Server {
         let compression = self.args.compress.to_compression();
         let follow_symlinks = self.args.allow_symlink;
         let serve_path = self.args.serve_path.clone();
+        let ip_whitelist = self.whitelist_snapshot();
         tokio::spawn(async move {
             if let Err(e) = zip_dir(
                 &mut writer,
                 &path,
                 access_paths,
+                ip_whitelist,
+                ip,
                 &hidden,
                 compression,
                 follow_symlinks,
@@ -720,6 +833,7 @@ impl Server {
         head_only: bool,
         user: Option<String>,
         access_paths: AccessPaths,
+        ip: Option<IpAddr>,
         res: &mut Response,
     ) -> Result<()> {
         let index_path = path.join(INDEX_NAME);
@@ -729,11 +843,24 @@ impl Server {
             .map(|v| v.is_file())
             .unwrap_or_default()
         {
+            if !self.entry_ip_allowed(&index_path, ip).await {
+                status_forbid(res);
+                return Ok(());
+            }
             self.handle_send_file(&index_path, headers, head_only, res)
                 .await?;
         } else if self.args.render_try_index {
-            self.handle_ls_dir(path, true, query_params, head_only, user, access_paths, res)
-                .await?;
+            self.handle_ls_dir(
+                path,
+                true,
+                query_params,
+                head_only,
+                user,
+                access_paths,
+                ip,
+                res,
+            )
+            .await?;
         } else {
             self.handle_not_found(query_params, head_only, res).await?;
         }
@@ -771,10 +898,15 @@ impl Server {
         query_params: &HashMap<String, String>,
         headers: &HeaderMap<HeaderValue>,
         head_only: bool,
+        ip: Option<IpAddr>,
         res: &mut Response,
     ) -> Result<()> {
         if path.extension().is_none() {
             let path = self.args.serve_path.join(INDEX_NAME);
+            if !self.entry_ip_allowed(&path, ip).await {
+                status_forbid(res);
+                return Ok(());
+            }
             self.handle_send_file(&path, headers, head_only, res)
                 .await?;
         } else {
@@ -1188,8 +1320,10 @@ impl Server {
         path: &Path,
         headers: &HeaderMap<HeaderValue>,
         access_paths: AccessPaths,
+        ip: Option<IpAddr>,
         res: &mut Response,
     ) -> Result<()> {
+        let show_all = self.args.allow_ip_whitelist && access_paths.perm().readwrite();
         let depth: u32 = match headers.get("depth") {
             Some(v) => match v.to_str().ok().and_then(|v| v.parse().ok()) {
                 Some(0) => 0,
@@ -1202,12 +1336,17 @@ impl Server {
             None => 1,
         };
         let mut paths = match self.to_pathitem(path, &self.args.serve_path).await? {
-            Some(v) => vec![v],
+            Some(mut v) => {
+                if show_all {
+                    v.whitelist = self.whitelist_label(path).await;
+                }
+                vec![v]
+            }
             None => vec![],
         };
         if depth == 1 {
             match self
-                .list_dir(path, &self.args.serve_path, access_paths)
+                .list_dir(path, &self.args.serve_path, access_paths, ip, show_all)
                 .await
             {
                 Ok(child) => paths.extend(child),
@@ -1243,8 +1382,14 @@ impl Server {
         Ok(())
     }
 
-    async fn handle_copy(&self, path: &Path, req: &Request, res: &mut Response) -> Result<()> {
-        let dest = match self.extract_dest(req, res).await {
+    async fn handle_copy(
+        &self,
+        path: &Path,
+        req: &Request,
+        ip: Option<IpAddr>,
+        res: &mut Response,
+    ) -> Result<()> {
+        let dest = match self.extract_dest(req, ip, res).await {
             Some(dest) => dest,
             None => {
                 return Ok(());
@@ -1286,8 +1431,14 @@ impl Server {
         Ok(())
     }
 
-    async fn handle_move(&self, path: &Path, req: &Request, res: &mut Response) -> Result<()> {
-        let dest = match self.extract_dest(req, res).await {
+    async fn handle_move(
+        &self,
+        path: &Path,
+        req: &Request,
+        ip: Option<IpAddr>,
+        res: &mut Response,
+    ) -> Result<()> {
+        let dest = match self.extract_dest(req, ip, res).await {
             Some(dest) => dest,
             None => {
                 return Ok(());
@@ -1414,6 +1565,7 @@ impl Server {
             allow_delete: self.args.allow_delete && readwrite,
             allow_search: self.args.allow_search,
             allow_archive: self.args.allow_archive,
+            allow_ip_whitelist: self.args.allow_ip_whitelist && readwrite,
             dir_exists: exist,
             auth: self.args.auth.has_users(),
             user,
@@ -1480,7 +1632,32 @@ impl Server {
             .unwrap_or_default()
     }
 
-    async fn extract_dest(&self, req: &Request, res: &mut Response) -> Option<PathBuf> {
+    /// Whether the path resolves into the metadata directory, following
+    /// symlinks even when they are otherwise allowed.
+    async fn guard_metadata_contained(&self, path: &Path) -> bool {
+        if self.args.path_is_file {
+            return false;
+        }
+        let metadata_dir = ip_whitelist_store::metadata_dir(&self.args.serve_path);
+        let mut check_path = path.to_path_buf();
+        while fs::symlink_metadata(&check_path).await.is_err() {
+            match check_path.parent() {
+                Some(parent) => check_path = parent.to_path_buf(),
+                None => return false,
+            }
+        }
+        fs::canonicalize(&check_path)
+            .await
+            .map(|v| v.starts_with(&metadata_dir))
+            .unwrap_or_default()
+    }
+
+    async fn extract_dest(
+        &self,
+        req: &Request,
+        ip: Option<IpAddr>,
+        res: &mut Response,
+    ) -> Option<PathBuf> {
         let headers = req.headers();
         let dest_path = match self
             .extract_destination_header(headers)
@@ -1514,6 +1691,11 @@ impl Server {
                 return None;
             }
         };
+
+        if !self.ip_allowed(&dest_path, ip).await {
+            status_forbid(res);
+            return None;
+        }
 
         let dest = match self.join_path(&dest_path) {
             Some(dest) => dest,
@@ -1575,33 +1757,215 @@ impl Server {
         join_within(&self.args.serve_path, &path)
     }
 
+    /// Snapshot the current whitelist so a request sees one consistent
+    /// configuration even if it is updated while the request is in flight.
+    fn whitelist_snapshot(&self) -> Arc<IpWhitelist> {
+        self.ip_whitelist
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Whether the client address may access a path relative to the serve root.
+    async fn ip_allowed(&self, path: &str, ip: Option<IpAddr>) -> bool {
+        self.whitelist_snapshot()
+            .allows(path, ip, Some(&self.args.serve_path))
+            .await
+    }
+
+    /// Whether the client address may access an entry by its on-disk path.
+    async fn entry_ip_allowed(&self, path: &Path, ip: Option<IpAddr>) -> bool {
+        let rel_path = path
+            .strip_prefix(&self.args.serve_path)
+            .map(normalize_path)
+            .unwrap_or_default();
+        self.ip_allowed(&rel_path, ip).await
+    }
+
+    /// The effective whitelist label for a path, as shown to managers.
+    async fn whitelist_label(&self, path: &Path) -> String {
+        let rel_path = path
+            .strip_prefix(&self.args.serve_path)
+            .map(normalize_path)
+            .unwrap_or_default();
+        let whitelist = self.whitelist_snapshot();
+        match whitelist.find(&rel_path, Some(&self.args.serve_path)).await {
+            Some(ips) => format_ip_whitelist(ips),
+            None => String::new(),
+        }
+    }
+
+    /// Whether a path resolves into the metadata directory.
+    async fn is_metadata_contained(&self, path: &Path) -> bool {
+        if self.args.path_is_file {
+            return false;
+        }
+        fs::canonicalize(path)
+            .await
+            .map(|v| v.starts_with(ip_whitelist_store::metadata_dir(&self.args.serve_path)))
+            .unwrap_or_default()
+    }
+
+    /// Read, replace or clear the persisted per-path ip whitelist.
+    async fn handle_ip_whitelist(&self, req: Request, method: Method) -> Result<Response> {
+        let mut res = Response::default();
+
+        if self.args.path_is_file || !self.args.allow_ip_whitelist {
+            status_forbid(&mut res);
+            return Ok(res);
+        }
+
+        let authorization = req.headers().get(AUTHORIZATION);
+        let (_, access_paths, _) = self
+            .args
+            .auth
+            .guard(
+                "/",
+                &method,
+                authorization,
+                None,
+                false,
+                &self.args.serve_path,
+            )
+            .await;
+        let access_paths = match access_paths {
+            Some(v) => v,
+            None => {
+                self.auth_reject(&mut res)?;
+                return Ok(res);
+            }
+        };
+        if !access_paths.perm().readwrite() {
+            status_forbid(&mut res);
+            return Ok(res);
+        }
+
+        match method {
+            Method::GET | Method::HEAD => {
+                let whitelist = self.whitelist_snapshot();
+                let store = ip_whitelist_store::StoreFile::from_whitelist(&whitelist);
+                let mut data = serde_json::json!({
+                    "version": store.version,
+                    "rules": store.rules,
+                });
+                // When a path is given, also report the whitelist that
+                // currently applies to it: null means unrestricted, an empty
+                // array means blocked, otherwise the effective members.
+                let query_params: HashMap<String, String> =
+                    form_urlencoded::parse(req.uri().query().unwrap_or_default().as_bytes())
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                if let Some(path) = query_params.get("path") {
+                    let effective = whitelist
+                        .find(path, Some(&self.args.serve_path))
+                        .await
+                        .map(|ips| ips.iter().map(|v| v.to_string()).collect::<Vec<_>>());
+                    data["path"] = serde_json::json!(path);
+                    data["effective"] = serde_json::json!(effective);
+                }
+                let body = serde_json::to_string_pretty(&data)?;
+                res.headers_mut()
+                    .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
+                res.headers_mut()
+                    .typed_insert(ContentLength(body.len() as u64));
+                if method == Method::GET {
+                    *res.body_mut() = body_full(body);
+                }
+            }
+            Method::PUT | Method::POST => {
+                let bytes = req
+                    .into_body()
+                    .collect()
+                    .await
+                    .map_err(|err| anyhow!("Failed to read request body, {err}"))?
+                    .to_bytes();
+                let store: ip_whitelist_store::StoreFile = match serde_json::from_slice(&bytes) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        status_bad_request(&mut res, &format!("Invalid JSON, {err}"));
+                        return Ok(res);
+                    }
+                };
+                let new_whitelist = match store.to_whitelist() {
+                    Ok(v) => v,
+                    Err(err) => {
+                        status_bad_request(&mut res, &err.to_string());
+                        return Ok(res);
+                    }
+                };
+                if let Err(err) = ip_whitelist_store::save(&self.args.serve_path, &new_whitelist) {
+                    error!("Failed to save ip-whitelist, {err}");
+                    *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    *res.body_mut() = body_full(format!("Failed to save ip-whitelist, {err}"));
+                    return Ok(res);
+                }
+                *self.ip_whitelist.write().unwrap_or_else(|e| e.into_inner()) =
+                    Arc::new(new_whitelist);
+                *res.status_mut() = StatusCode::NO_CONTENT;
+            }
+            Method::DELETE => {
+                let empty = IpWhitelist::default();
+                if let Err(err) = ip_whitelist_store::save(&self.args.serve_path, &empty) {
+                    error!("Failed to save ip-whitelist, {err}");
+                    *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    *res.body_mut() = body_full(format!("Failed to save ip-whitelist, {err}"));
+                    return Ok(res);
+                }
+                *self.ip_whitelist.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(empty);
+                *res.status_mut() = StatusCode::NO_CONTENT;
+            }
+            _ => {
+                *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+            }
+        }
+
+        Ok(res)
+    }
+
     async fn list_dir(
         &self,
         entry_path: &Path,
         base_path: &Path,
         access_paths: AccessPaths,
+        ip: Option<IpAddr>,
+        show_all: bool,
     ) -> Result<Vec<PathItem>> {
         let mut paths: Vec<PathItem> = vec![];
         if access_paths.perm().indexonly() {
             for name in access_paths.child_names() {
                 let entry_path = entry_path.join(name);
-                self.add_pathitem(&mut paths, base_path, &entry_path).await;
+                self.add_pathitem(&mut paths, base_path, &entry_path, ip, show_all)
+                    .await;
             }
         } else {
             let mut rd = fs::read_dir(entry_path).await?;
             while let Ok(Some(entry)) = rd.next_entry().await {
                 let entry_path = entry.path();
-                self.add_pathitem(&mut paths, base_path, &entry_path).await;
+                self.add_pathitem(&mut paths, base_path, &entry_path, ip, show_all)
+                    .await;
             }
         }
         Ok(paths)
     }
 
-    async fn add_pathitem(&self, paths: &mut Vec<PathItem>, base_path: &Path, entry_path: &Path) {
+    async fn add_pathitem(
+        &self,
+        paths: &mut Vec<PathItem>,
+        base_path: &Path,
+        entry_path: &Path,
+        ip: Option<IpAddr>,
+        show_all: bool,
+    ) {
+        if !show_all && !self.entry_ip_allowed(entry_path, ip).await {
+            return;
+        }
         let base_name = get_file_name(entry_path);
-        if let Ok(Some(item)) = self.to_pathitem(entry_path, base_path).await {
+        if let Ok(Some(mut item)) = self.to_pathitem(entry_path, base_path).await {
             if is_hidden(&self.args.hidden, base_name, item.is_dir()) {
                 return;
+            }
+            if show_all {
+                item.whitelist = self.whitelist_label(entry_path).await;
             }
             paths.push(item);
         }
@@ -1613,6 +1977,9 @@ impl Server {
         let (meta, meta2) = (meta?, meta2?);
         let is_symlink = meta2.is_symlink();
         if !self.args.allow_symlink && is_symlink && !self.is_root_contained(path).await {
+            return Ok(None);
+        }
+        if is_symlink && self.is_metadata_contained(path).await {
             return Ok(None);
         }
         let is_dir = meta.is_dir();
@@ -1657,6 +2024,7 @@ impl Server {
             name,
             mtime,
             size,
+            whitelist: String::new(),
         }))
     }
 }
@@ -1677,6 +2045,7 @@ pub struct IndexData {
     pub allow_delete: bool,
     pub allow_search: bool,
     pub allow_archive: bool,
+    pub allow_ip_whitelist: bool,
     pub dir_exists: bool,
     pub auth: bool,
     pub user: Option<String>,
@@ -1689,6 +2058,9 @@ pub struct PathItem {
     pub name: String,
     pub mtime: u64,
     pub size: u64,
+    /// Effective ip whitelist shown to managers: empty means allow all,
+    /// `blocked` means nobody may access it.
+    pub whitelist: String,
 }
 
 impl PathItem {
@@ -1871,6 +2243,8 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
     writer: &mut W,
     dir: &Path,
     access_paths: AccessPaths,
+    ip_whitelist: Arc<IpWhitelist>,
+    ip: Option<IpAddr>,
     hidden: &[String],
     compression: CompressionLevel,
     follow_symlinks: bool,
@@ -1880,6 +2254,9 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
     let hidden = Arc::new(hidden.to_vec());
     let zip_paths = tokio::task::spawn(collect_dir_entries(
         access_paths,
+        ip_whitelist,
+        ip,
+        false,
         running,
         dir.to_path_buf(),
         hidden,
@@ -1958,6 +2335,21 @@ fn set_content_disposition(res: &mut Response, inline: bool, filename: &str) -> 
     };
     res.headers_mut().insert(CONTENT_DISPOSITION, value);
     Ok(())
+}
+
+/// Render an effective whitelist for the WebUI. An allow-all range (0.0.0.0/0
+/// or ::/0) and an unrestricted path render as empty; an empty list is blocked.
+fn format_ip_whitelist(ips: &[IpNet]) -> String {
+    if ips.iter().any(|v| v.is_allow_all()) {
+        return String::new();
+    }
+    if ips.is_empty() {
+        return "blocked".to_string();
+    }
+    ips.iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn is_hidden(hidden: &[String], file_name: &str, is_dir: bool) -> bool {
@@ -2051,6 +2443,9 @@ fn has_query_flag(query_params: &HashMap<String, String>, name: &str) -> bool {
 
 async fn collect_dir_entries<F>(
     access_paths: AccessPaths,
+    ip_whitelist: Arc<IpWhitelist>,
+    ip: Option<IpAddr>,
+    bypass_ip: bool,
     running: Arc<AtomicBool>,
     path: PathBuf,
     hidden: Arc<Vec<String>>,
@@ -2096,6 +2491,25 @@ where
                 if is_dir {
                     it.skip_current_dir();
                 }
+                continue;
+            }
+            if entry.path_is_symlink()
+                && fs::canonicalize(entry_path)
+                    .await
+                    .ok()
+                    .map(|v| v.starts_with(ip_whitelist_store::metadata_dir(&serve_path)))
+                    .unwrap_or_default()
+            {
+                if is_dir {
+                    it.skip_current_dir();
+                }
+                continue;
+            }
+            let rel_path = entry_path
+                .strip_prefix(&serve_path)
+                .map(normalize_path)
+                .unwrap_or_default();
+            if !bypass_ip && !ip_whitelist.allows(&rel_path, ip, Some(&serve_path)).await {
                 continue;
             }
             if !include_entry(&entry) {

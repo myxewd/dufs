@@ -6,9 +6,23 @@ use fixtures::{port, server, tmpdir, wait_for_port, Error, Port, TestServer, DIR
 use rstest::rstest;
 use std::process::{Command, Stdio};
 
+/// The cache-busting suffix used in embedded asset urls, mirroring Server::init.
+fn assets_ver() -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(include_str!("../assets/index.html").as_bytes());
+    hasher.update(include_str!("../assets/index.css").as_bytes());
+    hasher.update(include_str!("../assets/index.js").as_bytes());
+    format!(
+        "{}_{}",
+        env!("CARGO_PKG_VERSION"),
+        hex::encode(&hasher.finalize()[..4])
+    )
+}
+
 #[rstest]
 fn assets(server: TestServer) -> Result<(), Error> {
-    let ver = env!("CARGO_PKG_VERSION");
+    let ver = assets_ver();
     let resp = reqwest::blocking::get(server.url())?;
     let index_js = format!("/__dufs_v{ver}__/index.js");
     let index_css = format!("/__dufs_v{ver}__/index.css");
@@ -23,11 +37,7 @@ fn assets(server: TestServer) -> Result<(), Error> {
 
 #[rstest]
 fn asset_js(server: TestServer) -> Result<(), Error> {
-    let url = format!(
-        "{}__dufs_v{}__/index.js",
-        server.url(),
-        env!("CARGO_PKG_VERSION")
-    );
+    let url = format!("{}__dufs_v{}__/index.js", server.url(), assets_ver());
     let resp = reqwest::blocking::get(url)?;
     assert_eq!(resp.status(), 200);
     assert_eq!(
@@ -39,11 +49,7 @@ fn asset_js(server: TestServer) -> Result<(), Error> {
 
 #[rstest]
 fn asset_css(server: TestServer) -> Result<(), Error> {
-    let url = format!(
-        "{}__dufs_v{}__/index.css",
-        server.url(),
-        env!("CARGO_PKG_VERSION")
-    );
+    let url = format!("{}__dufs_v{}__/index.css", server.url(), assets_ver());
     let resp = reqwest::blocking::get(url)?;
     assert_eq!(resp.status(), 200);
     assert_eq!(
@@ -55,11 +61,7 @@ fn asset_css(server: TestServer) -> Result<(), Error> {
 
 #[rstest]
 fn asset_ico(server: TestServer) -> Result<(), Error> {
-    let url = format!(
-        "{}__dufs_v{}__/favicon.ico",
-        server.url(),
-        env!("CARGO_PKG_VERSION")
-    );
+    let url = format!("{}__dufs_v{}__/favicon.ico", server.url(), assets_ver());
     let resp = reqwest::blocking::get(url)?;
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers().get("content-type").unwrap(), "image/x-icon");
@@ -68,11 +70,7 @@ fn asset_ico(server: TestServer) -> Result<(), Error> {
 
 #[rstest]
 fn head_asset_js(server: TestServer) -> Result<(), Error> {
-    let url = format!(
-        "{}__dufs_v{}__/index.js",
-        server.url(),
-        env!("CARGO_PKG_VERSION")
-    );
+    let url = format!("{}__dufs_v{}__/index.js", server.url(), assets_ver());
     let len = reqwest::blocking::get(&url)?.text()?.len();
     let resp = fetch!(b"HEAD", &url).send()?;
     assert_eq!(resp.status(), 200);
@@ -94,11 +92,7 @@ fn head_asset_js(server: TestServer) -> Result<(), Error> {
 
 #[rstest]
 fn head_asset_css(server: TestServer) -> Result<(), Error> {
-    let url = format!(
-        "{}__dufs_v{}__/index.css",
-        server.url(),
-        env!("CARGO_PKG_VERSION")
-    );
+    let url = format!("{}__dufs_v{}__/index.css", server.url(), assets_ver());
     let len = reqwest::blocking::get(&url)?.text()?.len();
     let resp = fetch!(b"HEAD", &url).send()?;
     assert_eq!(resp.status(), 200);
@@ -120,11 +114,7 @@ fn head_asset_css(server: TestServer) -> Result<(), Error> {
 
 #[rstest]
 fn head_asset_ico(server: TestServer) -> Result<(), Error> {
-    let url = format!(
-        "{}__dufs_v{}__/favicon.ico",
-        server.url(),
-        env!("CARGO_PKG_VERSION")
-    );
+    let url = format!("{}__dufs_v{}__/favicon.ico", server.url(), assets_ver());
     let len = reqwest::blocking::get(&url)?.bytes()?.len();
     let resp = fetch!(b"HEAD", &url).send()?;
     assert_eq!(resp.status(), 200);
@@ -143,11 +133,7 @@ fn head_asset_ico(server: TestServer) -> Result<(), Error> {
 
 #[rstest]
 fn head_asset_missing(server: TestServer) -> Result<(), Error> {
-    let url = format!(
-        "{}__dufs_v{}__/not-found.js",
-        server.url(),
-        env!("CARGO_PKG_VERSION")
-    );
+    let url = format!("{}__dufs_v{}__/not-found.js", server.url(), assets_ver());
     let resp = fetch!(b"HEAD", &url).send()?;
     assert_eq!(resp.status(), 404);
     assert_eq!(resp.text()?, "");
@@ -174,7 +160,7 @@ fn head_asset_override(tmpdir: TempDir, port: Port) -> Result<(), Error> {
 
     let url = format!(
         "http://localhost:{port}/__dufs_v{}__/index.js",
-        env!("CARGO_PKG_VERSION")
+        assets_ver()
     );
     let resp = fetch!(b"HEAD", &url).send()?;
     assert_eq!(resp.status(), 200);
@@ -187,7 +173,7 @@ fn head_asset_override(tmpdir: TempDir, port: Port) -> Result<(), Error> {
 
 #[rstest]
 fn assets_with_prefix(#[with(&["--path-prefix", "xyz"])] server: TestServer) -> Result<(), Error> {
-    let ver = env!("CARGO_PKG_VERSION");
+    let ver = assets_ver();
     let resp = reqwest::blocking::get(format!("{}xyz/", server.url()))?;
     let index_js = format!("/xyz/__dufs_v{ver}__/index.js");
     let index_css = format!("/xyz/__dufs_v{ver}__/index.css");
@@ -203,11 +189,7 @@ fn assets_with_prefix(#[with(&["--path-prefix", "xyz"])] server: TestServer) -> 
 fn asset_js_with_prefix(
     #[with(&["--path-prefix", "xyz"])] server: TestServer,
 ) -> Result<(), Error> {
-    let url = format!(
-        "{}xyz/__dufs_v{}__/index.js",
-        server.url(),
-        env!("CARGO_PKG_VERSION")
-    );
+    let url = format!("{}xyz/__dufs_v{}__/index.js", server.url(), assets_ver());
     let resp = reqwest::blocking::get(url)?;
     assert_eq!(resp.status(), 200);
     assert_eq!(
@@ -234,7 +216,7 @@ fn assets_override(tmpdir: TempDir, port: Port) -> Result<(), Error> {
     let resp = reqwest::blocking::get(&url)?;
     assert!(resp.text()?.starts_with(&format!(
         "/__dufs_v{}__/index.js;<template id=\"index-data\">",
-        env!("CARGO_PKG_VERSION")
+        assets_ver()
     )));
     let resp = reqwest::blocking::get(&url)?;
     assert_resp_paths!(resp);
@@ -278,7 +260,7 @@ fn assets_override_not_found_page(tmpdir: TempDir, port: Port) -> Result<(), Err
 
 #[rstest]
 fn assets_override_not_found_page_with_prefix(tmpdir: TempDir, port: Port) -> Result<(), Error> {
-    let ver = env!("CARGO_PKG_VERSION");
+    let ver = assets_ver();
     std::fs::write(
         tmpdir.join(format!("{}404.html", DIR_ASSETS)),
         r#"<link href="__ASSETS_PREFIX__logo.svg"><a href="__PATH_PREFIX__">home</a>"#,
@@ -314,7 +296,7 @@ fn assets_override_not_found_page_with_prefix(tmpdir: TempDir, port: Port) -> Re
 fn asset_drive_relative_path_is_not_served(tmpdir: TempDir, port: Port) -> Result<(), Error> {
     use std::path::Component;
 
-    let ver = env!("CARGO_PKG_VERSION");
+    let ver = assets_ver();
 
     // Run the server from a directory whose drive-relative form resolves to a
     // canary that is outside both the assets directory and the served root.

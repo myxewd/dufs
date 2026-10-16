@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::auth::AccessControl;
 use crate::http_logger::HttpLogger;
+use crate::ip_whitelist::{deserialize_ip_whitelist, IpWhitelist};
 use crate::utils::{encode_uri, is_ipv6_available};
 
 pub fn build_cli() -> Command {
@@ -100,6 +101,15 @@ pub fn build_cli() -> Command {
                 .value_name("value"),
         )
         .arg(
+            Arg::new("ip-whitelist")
+                .env("DUFS_IP_WHITELIST")
+                .hide_env(true)
+                .long("ip-whitelist")
+                .help("Set ip whitelist for paths, e.g. 127.0.0.1,10.0.0.0/8@/dir1")
+                .action(ArgAction::Append)
+                .value_name("rules"),
+        )
+        .arg(
             Arg::new("allow-all")
                 .env("DUFS_ALLOW_ALL")
 				.hide_env(true)
@@ -155,6 +165,14 @@ pub fn build_cli() -> Command {
                 .long("allow-hash")
                 .action(ArgAction::SetTrue)
                 .help("Allow ?hash query to get file sha256 hash"),
+        )
+        .arg(
+            Arg::new("allow-ip-whitelist")
+                .env("DUFS_ALLOW_IP_WHITELIST")
+                .hide_env(true)
+                .long("allow-ip-whitelist")
+                .action(ArgAction::SetTrue)
+                .help("Allow managing the per-path ip whitelist from the WebUI"),
         )
         .arg(
             Arg::new("enable-cors")
@@ -283,6 +301,8 @@ pub struct Args {
     pub hidden: Vec<String>,
     #[serde(deserialize_with = "deserialize_access_control")]
     pub auth: AccessControl,
+    #[serde(deserialize_with = "deserialize_ip_whitelist")]
+    pub ip_whitelist: IpWhitelist,
     pub allow_all: bool,
     pub allow_upload: bool,
     pub allow_delete: bool,
@@ -290,6 +310,7 @@ pub struct Args {
     pub allow_symlink: bool,
     pub allow_archive: bool,
     pub allow_hash: bool,
+    pub allow_ip_whitelist: bool,
     pub render_index: bool,
     pub render_spa: bool,
     pub render_try_index: bool,
@@ -367,6 +388,11 @@ impl Args {
             args.auth = AccessControl::new(&rules)?;
         }
 
+        if let Some(rules) = matches.get_many::<String>("ip-whitelist") {
+            let rules: Vec<String> = rules.cloned().collect();
+            args.ip_whitelist = IpWhitelist::new(&rules)?;
+        }
+
         if !args.allow_all {
             args.allow_all = matches.get_flag("allow-all");
         }
@@ -387,6 +413,9 @@ impl Args {
         }
         if !args.allow_hash {
             args.allow_hash = allow_all || matches.get_flag("allow-hash");
+        }
+        if !args.allow_ip_whitelist {
+            args.allow_ip_whitelist = allow_all || matches.get_flag("allow-ip-whitelist");
         }
         if !args.allow_archive {
             args.allow_archive = allow_all || matches.get_flag("allow-archive");
@@ -767,5 +796,58 @@ hidden:
             ]
         );
         assert_eq!(args.hidden, ["tmp", "*.log", "*.lock"]);
+    }
+
+    #[test]
+    fn test_args_ip_whitelist_cli() {
+        let cli = build_cli();
+        let matches = cli
+            .try_get_matches_from(vec![
+                "",
+                "--ip-whitelist",
+                "127.0.0.1@/dir1",
+                "--ip-whitelist",
+                "10.0.0.0/8,::1@/dir2",
+            ])
+            .unwrap();
+        let args = Args::parse(matches).unwrap();
+        assert!(!args.ip_whitelist.is_empty());
+    }
+
+    #[test]
+    fn test_args_ip_whitelist_config_forms() {
+        let tmpdir = assert_fs::TempDir::new().unwrap();
+        let config_file = tmpdir.child("config.yaml");
+
+        // list of rule strings
+        config_file
+            .write_str("ip-whitelist:\n  - '127.0.0.1@/dir1'\n  - '10.0.0.0/8@/dir2'\n")
+            .unwrap();
+        let matches = build_cli()
+            .try_get_matches_from(vec!["", "-c", &config_file.to_string_lossy()])
+            .unwrap();
+        let args = Args::parse(matches).unwrap();
+        assert!(!args.ip_whitelist.is_empty());
+
+        // mapping of path to one address or a list of addresses
+        config_file
+            .write_str(
+                "ip-whitelist:\n  /dir1: 127.0.0.1\n  /dir2:\n    - 10.0.0.0/8\n    - 192.168.0.0/16\n",
+            )
+            .unwrap();
+        let matches = build_cli()
+            .try_get_matches_from(vec!["", "-c", &config_file.to_string_lossy()])
+            .unwrap();
+        let args = Args::parse(matches).unwrap();
+        assert!(!args.ip_whitelist.is_empty());
+    }
+
+    #[test]
+    fn test_args_invalid_ip_whitelist() {
+        let cli = build_cli();
+        let matches = cli
+            .try_get_matches_from(vec!["", "--ip-whitelist", "not-an-ip@/dir1"])
+            .unwrap();
+        assert!(Args::parse(matches).is_err());
     }
 }

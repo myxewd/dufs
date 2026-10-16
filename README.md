@@ -61,6 +61,7 @@ Options:
       --path-prefix <path>   Specify a path prefix
       --hidden <value>       Hide paths from directory listings, e.g. tmp,*.log,*.lock
   -a, --auth <rules>         Add auth roles, e.g. user:pass@/dir1:rw,/dir2
+      --ip-whitelist <rules> Set ip whitelist for paths, e.g. 127.0.0.1,10.0.0.0/8@/dir1
   -A, --allow-all            Allow all operations
       --allow-upload         Allow upload files/folders
       --allow-delete         Allow delete files/folders
@@ -68,6 +69,7 @@ Options:
       --allow-symlink        Allow symlink to files/folders outside root directory
       --allow-archive        Allow download folders as archive file
       --allow-hash           Allow ?hash query to get file sha256 hash
+      --allow-ip-whitelist   Allow managing the per-path ip whitelist from the WebUI
       --enable-cors          Enable CORS, sets `Access-Control-Allow-Origin: *`
       --render-index         Serve index.html when requesting a directory, returns 404 if not found index.html
       --render-try-index     Serve index.html when requesting a directory, returns directory listing if not found index.html
@@ -271,6 +273,55 @@ Two important things for hashed passwords:
 2. Digest authentication does not function properly with hashed passwords.
 
 
+### IP Whitelist
+
+Dufs can restrict a file or a directory to a list of client addresses with `--ip-whitelist`.
+
+```sh
+dufs --ip-whitelist '127.0.0.1,192.168.0.0/16@/public'
+dufs --ip-whitelist '127.0.0.1@/dir1' --ip-whitelist '10.0.0.0/8@/dir1/file.txt'
+dufs --ip-whitelist '127.0.0.1@/dir1|10.0.0.0/8@/dir2'
+```
+
+1. Use `@` to separate the address list and the path, e.g. `ips@/path`.
+2. Use `,` to separate addresses. Each entry is an IP or a CIDR range.
+3. Use `|` to separate rules, or repeat `--ip-whitelist`.
+4. An empty address list (`@/dir1`) denies the path to everyone.
+5. A missing `@` applies the address list to the served root.
+6. A path with no rule of its own inherits the closest configured ancestor, and a rule set on a file overrides the rule set on its directory.
+7. Paths with no configured ancestor are unrestricted.
+
+```sh
+# localhost only; nobody may read .git
+dufs --ip-whitelist '127.0.0.1@/' --ip-whitelist '@/.git'
+```
+
+The whitelist also applies to directory listings, search results, WebDAV `PROPFIND` and folder archives, so a denied entry is not leaked through them. When the client address is unknown, e.g. over a unix socket, a configured address list denies access.
+
+In the configuration file the same value can also be written as a mapping from path to an address list.
+
+```yaml
+ip-whitelist:
+  /dir1: 127.0.0.1
+  /dir2:
+    - 10.0.0.0/8
+    - 192.168.0.0/16
+```
+
+#### Managing from the WebUI
+
+Start dufs with `--allow-ip-whitelist` (or `-A`) and a shield button appears in the WebUI toolbar and on every row. It opens a one-field editor for that file or directory. Only users with read-write access to the root may use it.
+
+The list gets a `Whitelist` column: an empty list renders as `blocked` (nobody may access the path), a list containing `0.0.0.0/0` (or `::/0`) renders as blank (everyone may access it), and any other list shows its members. The editor pre-fills the whitelist that currently applies, so a path with no rule of its own shows `0.0.0.0/0` (everyone) and an empty input always means `blocked`. `Remove rule` drops the path's own rule so it inherits its closest configured parent again. A manager can still see and configure a path its own address is not allowed to access, but reading that content returns 403.
+
+Rules are stored in `<serve-path>/.dufs/ip-whitelist.json`. The `.dufs` directory holds dufs metadata: it is never listed, downloaded, searched, archived or served, and it cannot be written to over HTTP.
+
+```sh
+dufs --allow-ip-whitelist
+```
+
+The stored file is authoritative. When management is enabled and no store exists yet, the `--ip-whitelist` rules seed it; a CLI-only run keeps those rules in memory instead. Delete `.dufs/ip-whitelist.json` to start over.
+
 ### Hide Paths
 
 Dufs supports hiding paths from directory listings via option `--hidden <glob>,...`.
@@ -348,6 +399,7 @@ All options can be set using environment variables prefixed with `DUFS_`.
     --path-prefix <path>    DUFS_PATH_PREFIX=/dufs
     --hidden <value>        DUFS_HIDDEN=tmp,*.log,*.lock
 -a, --auth <rules>          DUFS_AUTH="admin:admin@/:rw|@/" 
+    --ip-whitelist <rules>  DUFS_IP_WHITELIST="127.0.0.1@/dir1"
 -A, --allow-all             DUFS_ALLOW_ALL=true
     --allow-upload          DUFS_ALLOW_UPLOAD=true
     --allow-delete          DUFS_ALLOW_DELETE=true
@@ -355,6 +407,7 @@ All options can be set using environment variables prefixed with `DUFS_`.
     --allow-symlink         DUFS_ALLOW_SYMLINK=true
     --allow-archive         DUFS_ALLOW_ARCHIVE=true
     --allow-hash            DUFS_ALLOW_HASH=true
+    --allow-ip-whitelist    DUFS_ALLOW_IP_WHITELIST=true
     --enable-cors           DUFS_ENABLE_CORS=true
     --render-index          DUFS_RENDER_INDEX=true
     --render-try-index      DUFS_RENDER_TRY_INDEX=true
@@ -386,6 +439,9 @@ auth:
   - admin:admin@/:rw
   - user:pass@/src:rw,/share
   - '@/'  # According to the YAML spec, quoting is required.
+ip-whitelist:
+  - '127.0.0.1,192.168.0.0/16@/'
+  - '@/.git'  # According to the YAML spec, quoting is required.
 allow-all: false
 allow-upload: true
 allow-delete: true
@@ -393,6 +449,7 @@ allow-search: true
 allow-symlink: true
 allow-archive: true
 allow-hash: true
+allow-ip-whitelist: true
 enable-cors: true
 render-index: true
 render-try-index: true
