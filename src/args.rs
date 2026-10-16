@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::auth::AccessControl;
 use crate::http_logger::HttpLogger;
 use crate::ip_whitelist::{deserialize_ip_whitelist, IpWhitelist};
+use crate::trusted_proxy::{deserialize_trusted_proxies, TrustedProxies};
 use crate::utils::{encode_uri, is_ipv6_available};
 
 pub fn build_cli() -> Command {
@@ -108,6 +109,16 @@ pub fn build_cli() -> Command {
                 .help("Set ip whitelist for paths, e.g. 127.0.0.1,10.0.0.0/8@/dir1")
                 .action(ArgAction::Append)
                 .value_name("rules"),
+        )
+        .arg(
+            Arg::new("trusted-proxy")
+                .env("DUFS_TRUSTED_PROXY")
+                .hide_env(true)
+                .long("trusted-proxy")
+                .help("Trust forwarded headers from these proxy addresses, e.g. 127.0.0.1,10.0.0.0/8")
+                .action(ArgAction::Append)
+                .value_delimiter(',')
+                .value_name("addrs"),
         )
         .arg(
             Arg::new("allow-all")
@@ -303,6 +314,8 @@ pub struct Args {
     pub auth: AccessControl,
     #[serde(deserialize_with = "deserialize_ip_whitelist")]
     pub ip_whitelist: IpWhitelist,
+    #[serde(deserialize_with = "deserialize_trusted_proxies")]
+    pub trusted_proxy: TrustedProxies,
     pub allow_all: bool,
     pub allow_upload: bool,
     pub allow_delete: bool,
@@ -391,6 +404,11 @@ impl Args {
         if let Some(rules) = matches.get_many::<String>("ip-whitelist") {
             let rules: Vec<String> = rules.cloned().collect();
             args.ip_whitelist = IpWhitelist::new(&rules)?;
+        }
+
+        if let Some(proxies) = matches.get_many::<String>("trusted-proxy") {
+            let proxies: Vec<String> = proxies.cloned().collect();
+            args.trusted_proxy = TrustedProxies::new(&proxies)?;
         }
 
         if !args.allow_all {
@@ -847,6 +865,42 @@ hidden:
         let cli = build_cli();
         let matches = cli
             .try_get_matches_from(vec!["", "--ip-whitelist", "not-an-ip@/dir1"])
+            .unwrap();
+        assert!(Args::parse(matches).is_err());
+    }
+
+    #[test]
+    fn test_args_trusted_proxy_cli() {
+        let cli = build_cli();
+        let matches = cli
+            .try_get_matches_from(vec!["", "--trusted-proxy", "127.0.0.1,10.0.0.0/8"])
+            .unwrap();
+        let args = Args::parse(matches).unwrap();
+        assert!(args.trusted_proxy.contains("127.0.0.1".parse().unwrap()));
+        assert!(args.trusted_proxy.contains("10.1.2.3".parse().unwrap()));
+        assert!(!args.trusted_proxy.contains("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_args_trusted_proxy_config() {
+        let tmpdir = assert_fs::TempDir::new().unwrap();
+        let config_file = tmpdir.child("config.yaml");
+        config_file
+            .write_str("trusted-proxy:\n  - 127.0.0.1\n  - 10.0.0.0/8\n")
+            .unwrap();
+        let matches = build_cli()
+            .try_get_matches_from(vec!["", "-c", &config_file.to_string_lossy()])
+            .unwrap();
+        let args = Args::parse(matches).unwrap();
+        assert!(args.trusted_proxy.contains("127.0.0.1".parse().unwrap()));
+        assert!(args.trusted_proxy.contains("10.9.9.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_args_invalid_trusted_proxy() {
+        let cli = build_cli();
+        let matches = cli
+            .try_get_matches_from(vec!["", "--trusted-proxy", "not-an-ip"])
             .unwrap();
         assert!(Args::parse(matches).is_err());
     }

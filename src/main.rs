@@ -7,6 +7,7 @@ mod ip_whitelist_store;
 mod logger;
 mod noscript;
 mod server;
+mod trusted_proxy;
 mod utils;
 
 #[macro_use]

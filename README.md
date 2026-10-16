@@ -62,6 +62,7 @@ Options:
       --hidden <value>       Hide paths from directory listings, e.g. tmp,*.log,*.lock
   -a, --auth <rules>         Add auth roles, e.g. user:pass@/dir1:rw,/dir2
       --ip-whitelist <rules> Set ip whitelist for paths, e.g. 127.0.0.1,10.0.0.0/8@/dir1
+      --trusted-proxy <addrs> Trust forwarded headers from these proxy addresses, e.g. 127.0.0.1,10.0.0.0/8
   -A, --allow-all            Allow all operations
       --allow-upload         Allow upload files/folders
       --allow-delete         Allow delete files/folders
@@ -322,6 +323,18 @@ dufs --allow-ip-whitelist
 
 The stored file is authoritative. When management is enabled and no store exists yet, the `--ip-whitelist` rules seed it; a CLI-only run keeps those rules in memory instead. Delete `.dufs/ip-whitelist.json` to start over.
 
+#### Behind a reverse proxy
+
+By default the client address is the TCP peer. Behind a reverse proxy that peer is the proxy itself, so a whitelist of real client addresses would deny everyone. List the proxy addresses with `--trusted-proxy` and dufs then takes the client address from `X-Forwarded-For`, falling back to `X-Real-IP`, **only when the connection comes from one of them**.
+
+```sh
+dufs --ip-whitelist '203.0.113.9@/private' --trusted-proxy 127.0.0.1,10.0.0.0/8
+```
+
+The forwarded list is read from right to left and the first address that is not itself a trusted proxy is used, so a well-behaved chain resolves to the real client while a spoofed prefix is ignored. The resolved address is also what `$remote_addr` logs.
+
+> Never list `0.0.0.0/0`, and make sure dufs is not directly reachable from untrusted clients: a trusted peer that is not really a proxy lets a client forge its address and bypass the whitelist.
+
 ### Hide Paths
 
 Dufs supports hiding paths from directory listings via option `--hidden <glob>,...`.
@@ -400,6 +413,7 @@ All options can be set using environment variables prefixed with `DUFS_`.
     --hidden <value>        DUFS_HIDDEN=tmp,*.log,*.lock
 -a, --auth <rules>          DUFS_AUTH="admin:admin@/:rw|@/" 
     --ip-whitelist <rules>  DUFS_IP_WHITELIST="127.0.0.1@/dir1"
+    --trusted-proxy <addrs> DUFS_TRUSTED_PROXY="127.0.0.1,10.0.0.0/8"
 -A, --allow-all             DUFS_ALLOW_ALL=true
     --allow-upload          DUFS_ALLOW_UPLOAD=true
     --allow-delete          DUFS_ALLOW_DELETE=true
@@ -442,6 +456,9 @@ auth:
 ip-whitelist:
   - '127.0.0.1,192.168.0.0/16@/'
   - '@/.git'  # According to the YAML spec, quoting is required.
+trusted-proxy:
+  - 127.0.0.1
+  - 10.0.0.0/8
 allow-all: false
 allow-upload: true
 allow-delete: true

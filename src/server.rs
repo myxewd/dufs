@@ -149,9 +149,11 @@ impl Server {
         let assets_prefix = &self.assets_prefix;
         let enable_cors = self.args.enable_cors;
         let mut http_log_data = self.args.http_logger.data(&req);
-        let client_ip = addr.map(|addr| addr.ip());
-        if let Some(addr) = addr {
-            http_log_data.insert("remote_addr".to_string(), addr.ip().to_string());
+        // Behind a trusted proxy the forwarded header identifies the client;
+        // otherwise only the socket peer is trusted.
+        let client_ip = addr.map(|addr| self.args.trusted_proxy.resolve(addr.ip(), req.headers()));
+        if let Some(ip) = client_ip {
+            http_log_data.insert("remote_addr".to_string(), ip.to_string());
         }
 
         let mut res = match self.clone().handle(req, client_ip).await {
