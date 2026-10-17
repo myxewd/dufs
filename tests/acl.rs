@@ -257,6 +257,387 @@ fn acl_controls_read_write_and_x(tmpdir: TempDir, port: Port) -> Result<(), Erro
     Ok(())
 }
 #[rstest]
+fn acl_rules_follow_a_move(tmpdir: TempDir, port: Port) -> Result<(), Error> {
+    // carol may write the tree but is denied /team/secret: renaming /team must
+    // carry the deny along, otherwise the content lands in an area she may read
+    std::fs::create_dir_all(tmpdir.path().join(".dufs"))?;
+    std::fs::create_dir_all(tmpdir.path().join("team/secret"))?;
+    std::fs::write(tmpdir.path().join("team/secret/leak.txt"), "leaked")?;
+    std::fs::write(
+        tmpdir.path().join(".dufs/user-acl.json"),
+        r#"{ "version": 1, "rules": {
+            "/": { "allow_write": ["carol"] },
+            "/team/secret": { "deny_read": ["carol"] }
+        } }"#,
+    )?;
+    std::fs::write(
+        tmpdir.path().join(".dufs/ip-whitelist.json"),
+        r#"{ "version": 1, "rules": { "/team/secret": ["127.0.0.1"] } }"#,
+    )?;
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-A")
+        .arg("--allow-ip-whitelist")
+        .arg("--auth")
+        .arg("guest:guest@/:ro")
+        .arg("--auth")
+        .arg("carol:carol@/:rw")
+        .arg("--auth")
+        .arg("admin:admin@/:rwx")
+        .stdout(Stdio::null())
+        .spawn()?;
+    wait_for_port(&port);
+    let base = format!("http://localhost:{port}");
+    let client = client();
+    let get = |as_user: &str, path: &str| -> Result<reqwest::blocking::Response, Error> {
+        Ok(client
+            .get(format!("{base}{path}"))
+            .basic_auth(as_user, Some(as_user))
+            .send()?)
+    };
+
+    assert_eq!(get("carol", "/team/secret/leak.txt")?.status(), 403);
+    let resp = client
+        .request(
+            reqwest::Method::from_bytes(b"MOVE")?,
+            format!("{base}/team"),
+        )
+        .basic_auth("carol", Some("carol"))
+        .header("destination", format!("http://localhost:{port}/team2"))
+        .send()?;
+    assert_eq!(resp.status(), 204);
+    // the deny moved with the content: still no access at the new path
+    assert_eq!(get("carol", "/team2/secret/leak.txt")?.status(), 403);
+    // the admin sees the file where it now is
+    let resp = get("admin", "/team2/secret/leak.txt")?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text()?, "leaked");
+
+    // both stores report the rule at its new path and nothing at the old one
+    let acl = |path: &str| -> Result<serde_json::Value, Error> {
+        let resp = get("admin", &format!("/__dufs__/acl?path={path}"))?;
+        assert_eq!(resp.status(), 200);
+        Ok(serde_json::from_str(&resp.text()?)?)
+    };
+    assert_eq!(
+        acl("/team2/secret")?["deny_read"],
+        serde_json::json!(["carol"])
+    );
+    assert!(acl("/team/secret")?["deny_read"].is_null());
+    let resp = get("admin", "/__dufs__/ip-whitelist")?;
+    let ips: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert_eq!(
+        ips["rules"]["/team2/secret"],
+        serde_json::json!(["127.0.0.1"])
+    );
+    assert!(ips["rules"]["/team/secret"].is_null());
+
+    // a destination that already carries rules is refused instead of merging
+    let resp = client
+        .put(format!("{base}/__dufs__/acl?path=/blocked"))
+        .basic_auth("admin", Some("admin"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(
+            &serde_json::json!({ "allow_read": ["bob"] }),
+        )?)
+        .send()?;
+    assert_eq!(resp.status(), 204);
+    let resp = client
+        .request(
+            reqwest::Method::from_bytes(b"MOVE")?,
+            format!("{base}/team2"),
+        )
+        .basic_auth("carol", Some("carol"))
+        .header("destination", format!("http://localhost:{port}/blocked"))
+        .send()?;
+    assert_eq!(resp.status(), 409);
+    // nothing moved on disk either
+    assert_eq!(get("admin", "/team2/secret/leak.txt")?.status(), 200);
+    assert_eq!(get("carol", "/team2/secret/leak.txt")?.status(), 403);
+
+    child.kill()?;
+    Ok(())
+}
+
+#[rstest]
+fn acl_rules_are_dropped_with_the_content(tmpdir: TempDir, port: Port) -> Result<(), Error> {
+    // deleting a path has to drop the rules that describe it, otherwise a new
+    // entry created at the same path silently inherits them
+    std::fs::create_dir_all(tmpdir.path().join(".dufs"))?;
+    std::fs::create_dir_all(tmpdir.path().join("team/secret"))?;
+    std::fs::write(tmpdir.path().join("team/secret/old.txt"), "old")?;
+    std::fs::write(
+        tmpdir.path().join(".dufs/user-acl.json"),
+        r#"{ "version": 1, "rules": {
+            "/": { "allow_write": ["carol"] },
+            "/team/secret": { "deny_read": ["carol"] },
+            "/team2": { "allow_read": ["bob"] }
+        } }"#,
+    )?;
+    std::fs::write(
+        tmpdir.path().join(".dufs/ip-whitelist.json"),
+        r#"{ "version": 1, "rules": { "/team/secret": [] } }"#,
+    )?;
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-A")
+        .arg("--allow-ip-whitelist")
+        .arg("--auth")
+        .arg("guest:guest@/:ro")
+        .arg("--auth")
+        .arg("carol:carol@/:rw")
+        .arg("--auth")
+        .arg("admin:admin@/:rwx")
+        .stdout(Stdio::null())
+        .spawn()?;
+    wait_for_port(&port);
+    let base = format!("http://localhost:{port}");
+    let client = client();
+
+    let resp = client
+        .delete(format!("{base}/team"))
+        .basic_auth("carol", Some("carol"))
+        .send()?;
+    assert_eq!(resp.status(), 204);
+
+    let get = |as_user: &str, path: &str| -> Result<reqwest::blocking::Response, Error> {
+        Ok(client
+            .get(format!("{base}{path}"))
+            .basic_auth(as_user, Some(as_user))
+            .send()?)
+    };
+    // both stores forgot the deleted subtree
+    let acl: serde_json::Value =
+        serde_json::from_str(&get("admin", "/__dufs__/acl?path=/team/secret")?.text()?)?;
+    assert!(acl["deny_read"].is_null(), "{acl}");
+    let ips: serde_json::Value =
+        serde_json::from_str(&get("admin", "/__dufs__/ip-whitelist")?.text()?)?;
+    assert!(ips["rules"]["/team/secret"].is_null(), "{ips}");
+    // a rule on a sibling is untouched
+    let acl: serde_json::Value =
+        serde_json::from_str(&get("admin", "/__dufs__/acl?path=/team2")?.text()?)?;
+    assert_eq!(acl["allow_read"], serde_json::json!(["bob"]));
+
+    // recreating the path starts from the inherited rule, not from the stale one
+    let mkdir = |path: &str| -> Result<reqwest::blocking::Response, Error> {
+        Ok(client
+            .request(
+                reqwest::Method::from_bytes(b"MKCOL")?,
+                format!("{base}{path}"),
+            )
+            .basic_auth("carol", Some("carol"))
+            .send()?)
+    };
+    assert_eq!(mkdir("/team")?.status(), 201);
+    assert_eq!(mkdir("/team/secret")?.status(), 201);
+    let resp = client
+        .put(format!("{base}/team/secret/new.txt"))
+        .basic_auth("carol", Some("carol"))
+        .body("new")
+        .send()?;
+    assert_eq!(resp.status(), 201);
+    let resp = get("carol", "/team/secret/new.txt")?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text()?, "new");
+
+    child.kill()?;
+    Ok(())
+}
+
+#[rstest]
+fn acl_traverse_with_render_index(tmpdir: TempDir, port: Port) -> Result<(), Error> {
+    // /a has an index page the user may not read, but she must still be able to
+    // walk to /a/b where she is granted
+    std::fs::create_dir_all(tmpdir.path().join(".dufs"))?;
+    std::fs::create_dir_all(tmpdir.path().join("a/b"))?;
+    std::fs::write(tmpdir.path().join("a/index.html"), "a index")?;
+    std::fs::write(tmpdir.path().join("a/b/target.txt"), "target")?;
+    std::fs::write(
+        tmpdir.path().join(".dufs/user-acl.json"),
+        r#"{ "version": 1, "rules": {
+            "/": { "allow_read": ["bob"] },
+            "/a/b": { "allow_read": ["alice"] }
+        } }"#,
+    )?;
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("--render-try-index")
+        .arg("--auth")
+        .arg("guest:guest@/:ro")
+        .arg("--auth")
+        .arg("bob:bob@/:ro")
+        .arg("--auth")
+        .arg("alice:alice@/:ro")
+        .arg("--auth")
+        .arg("admin:admin@/:rwx")
+        .stdout(Stdio::null())
+        .spawn()?;
+    wait_for_port(&port);
+    let base = format!("http://localhost:{port}");
+    let client = client();
+
+    let resp = client
+        .get(format!("{base}/a/?json"))
+        .basic_auth("alice", Some("alice"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert_eq!(names(&data), vec!["b".to_string()]);
+    // the page itself stays private
+    let resp = client
+        .get(format!("{base}/a/index.html"))
+        .basic_auth("alice", Some("alice"))
+        .send()?;
+    assert_eq!(resp.status(), 403);
+    // a user that may read the directory keeps getting the index page
+    let resp = client
+        .get(format!("{base}/a/"))
+        .basic_auth("bob", Some("bob"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text()?, "a index");
+    // the root is only walkable, so it is listed instead of its index page
+    let resp = client
+        .get(format!("{base}/?json"))
+        .basic_auth("alice", Some("alice"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert_eq!(names(&data), vec!["a".to_string()]);
+
+    child.kill()?;
+    Ok(())
+}
+
+#[rstest]
+fn acl_traverse_reaches_granted_child(tmpdir: TempDir, port: Port) -> Result<(), Error> {
+    // alice is granted one nested directory while the root only lists bob, so
+    // the ancestors have to stay walkable or the grant is unreachable
+    std::fs::create_dir_all(tmpdir.path().join(".dufs"))?;
+    std::fs::create_dir_all(tmpdir.path().join("a/b/c"))?;
+    std::fs::write(tmpdir.path().join("a/b/c/target.txt"), "target")?;
+    std::fs::write(tmpdir.path().join("a/b/sibling.txt"), "sibling")?;
+    std::fs::write(
+        tmpdir.path().join(".dufs/user-acl.json"),
+        r#"{ "version": 1, "rules": {
+            "/": { "allow_read": ["bob"] },
+            "/a/b/c": { "allow_read": ["alice"] },
+            "/test.txt/sub": { "allow_read": ["alice"] }
+        } }"#,
+    )?;
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-A")
+        .arg("--auth")
+        .arg("guest:guest@/:ro")
+        .arg("--auth")
+        .arg("bob:bob@/:ro")
+        .arg("--auth")
+        .arg("alice:alice@/:ro")
+        .arg("--auth")
+        .arg("admin:admin@/:rwx")
+        .stdout(Stdio::null())
+        .spawn()?;
+    wait_for_port(&port);
+    let base = format!("http://localhost:{port}");
+    let client = client();
+    let get = |path: &str| -> Result<reqwest::blocking::Response, Error> {
+        Ok(client
+            .get(format!("{base}{path}"))
+            .basic_auth("alice", Some("alice"))
+            .send()?)
+    };
+    let list = |path: &str| -> Result<Vec<String>, Error> {
+        let resp = get(path)?;
+        assert_eq!(resp.status(), 200, "{path}");
+        let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+        Ok(names(&data))
+    };
+
+    // only the ancestor chain is listed, never the root's other entries
+    assert_eq!(list("/?json")?, vec!["a".to_string()]);
+    assert_eq!(list("/a/?json")?, vec!["b".to_string()]);
+    assert_eq!(list("/a/b/?json")?, vec!["c".to_string()]);
+    assert_eq!(list("/a/b/c/?json")?, vec!["target.txt".to_string()]);
+    // the grant itself stays readable
+    let resp = get("/a/b/c/target.txt")?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text()?, "target");
+    // a sibling without a grant is still hidden and still refused
+    assert_eq!(get("/a/b/sibling.txt")?.status(), 403);
+    // a rule below a *file* path must not turn the file itself readable
+    assert_eq!(get("/test.txt")?.status(), 403);
+
+    // a traversed directory is a listing only: it never allows writing
+    let resp = client
+        .put(format!("{base}/a/new.txt"))
+        .basic_auth("alice", Some("alice"))
+        .body("new")
+        .send()?;
+    assert_eq!(resp.status(), 403);
+    let resp = client
+        .put(format!("{base}/a/b/new.txt"))
+        .basic_auth("alice", Some("alice"))
+        .body("new")
+        .send()?;
+    assert_eq!(resp.status(), 403);
+    let resp = client
+        .request(
+            reqwest::Method::from_bytes(b"MKCOL")?,
+            format!("{base}/a/newdir"),
+        )
+        .basic_auth("alice", Some("alice"))
+        .send()?;
+    assert_eq!(resp.status(), 403);
+    // deleting the grant still needs write on its parent, which alice lacks
+    let resp = client
+        .delete(format!("{base}/a/b/c/target.txt"))
+        .basic_auth("alice", Some("alice"))
+        .send()?;
+    assert_eq!(resp.status(), 403);
+    let data: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("{base}/a/?json"))
+            .basic_auth("alice", Some("alice"))
+            .send()?
+            .text()?,
+    )?;
+    assert_eq!(data["allow_upload"], false);
+    assert_eq!(data["allow_delete"], false);
+
+    // search reaches through a traversed directory
+    let searched = list("/?q=target&json")?;
+    assert_eq!(searched, vec!["a/b/c/target.txt".to_string()]);
+
+    // bob keeps full read of the managed tree
+    let bob = |path: &str| -> Result<Vec<String>, Error> {
+        let resp = client
+            .get(format!("{base}{path}"))
+            .basic_auth("bob", Some("bob"))
+            .send()?;
+        assert_eq!(resp.status(), 200, "{path}");
+        let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+        Ok(names(&data))
+    };
+    assert!(bob("/?json")?.contains(&"a".to_string()));
+    assert_eq!(
+        bob("/a/b/?json")?,
+        vec!["c".to_string(), "sibling.txt".to_string()]
+    );
+
+    child.kill()?;
+    Ok(())
+}
+
+#[rstest]
 fn acl_api_and_login_challenge(tmpdir: TempDir, port: Port) -> Result<(), Error> {
     let mut child = start_acl(&tmpdir, &port, "guest:guest@/:ro")?;
     wait_for_port(&port);

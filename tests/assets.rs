@@ -20,6 +20,24 @@ fn assets_ver() -> String {
     )
 }
 
+/// The cache-busting suffix of an overridden assets directory. The server
+/// hashes the files it actually serves (see `Server::init`), so a test that
+/// passes `--assets` has to mirror that instead of using the embedded hash.
+fn assets_ver_of(dir: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for name in ["index.html", "index.css", "index.js"] {
+        if let Ok(bytes) = std::fs::read(dir.join(name)) {
+            hasher.update(&bytes);
+        }
+    }
+    format!(
+        "{}_{}",
+        env!("CARGO_PKG_VERSION"),
+        hex::encode(&hasher.finalize()[..4])
+    )
+}
+
 #[rstest]
 fn assets(server: TestServer) -> Result<(), Error> {
     let ver = assets_ver();
@@ -160,7 +178,7 @@ fn head_asset_override(tmpdir: TempDir, port: Port) -> Result<(), Error> {
 
     let url = format!(
         "http://localhost:{port}/__dufs_v{}__/index.js",
-        assets_ver()
+        assets_ver_of(&tmpdir.join(DIR_ASSETS))
     );
     let resp = fetch!(b"HEAD", &url).send()?;
     assert_eq!(resp.status(), 200);
@@ -216,7 +234,7 @@ fn assets_override(tmpdir: TempDir, port: Port) -> Result<(), Error> {
     let resp = reqwest::blocking::get(&url)?;
     assert!(resp.text()?.starts_with(&format!(
         "/__dufs_v{}__/index.js;<template id=\"index-data\">",
-        assets_ver()
+        assets_ver_of(&tmpdir.join(DIR_ASSETS))
     )));
     let resp = reqwest::blocking::get(&url)?;
     assert_resp_paths!(resp);
@@ -260,7 +278,7 @@ fn assets_override_not_found_page(tmpdir: TempDir, port: Port) -> Result<(), Err
 
 #[rstest]
 fn assets_override_not_found_page_with_prefix(tmpdir: TempDir, port: Port) -> Result<(), Error> {
-    let ver = assets_ver();
+    let ver = assets_ver_of(&tmpdir.join(DIR_ASSETS));
     std::fs::write(
         tmpdir.join(format!("{}404.html", DIR_ASSETS)),
         r#"<link href="__ASSETS_PREFIX__logo.svg"><a href="__PATH_PREFIX__">home</a>"#,

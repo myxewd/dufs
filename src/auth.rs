@@ -493,6 +493,25 @@ impl AccessPaths {
     }
 }
 
+/// The key a child is stored under, resolved the same way
+/// [`find_child_alias`] resolves it: the exact spelling first, then a
+/// filesystem alias. Needed by the stores to move a rule subtree with a rename.
+pub(crate) async fn resolve_child_key<T>(
+    children: &IndexMap<String, T>,
+    name: &str,
+    prefix: &[&str],
+    root: Option<&Path>,
+) -> Option<String> {
+    if let Some(key) = children.keys().find(|key| key.as_str() == name) {
+        return Some(key.clone());
+    }
+    let child = find_child_alias(children, name, prefix, root).await?;
+    children
+        .iter()
+        .find(|(_, value)| std::ptr::eq(*value, child))
+        .map(|(key, _)| key.clone())
+}
+
 /// Find a configured child whose name the backing filesystem resolves to the
 /// same object as `name` under `prefix` (a path relative to `root`).
 ///

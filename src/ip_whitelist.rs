@@ -1,4 +1,4 @@
-use crate::auth::find_child_alias;
+use crate::auth::{find_child_alias, resolve_child_key};
 
 use anyhow::{bail, Context, Result};
 use indexmap::IndexMap;
@@ -276,24 +276,26 @@ impl IpWhitelist {
 
     /// All explicitly configured rules as `(path, address strings)` pairs.
     pub fn rules(&self) -> Vec<(String, Vec<String>)> {
+        self.rule_nodes()
+            .into_iter()
+            .map(|(path, ips)| (path, ips.iter().map(|v| v.to_string()).collect()))
+            .collect()
+    }
+
+    fn rule_nodes(&self) -> Vec<(String, Vec<IpNet>)> {
         let mut output = Vec::new();
         self.collect_rules(&self.root, String::new(), &mut output);
         output
     }
 
-    fn collect_rules(
-        &self,
-        node: &IpNode,
-        prefix: String,
-        output: &mut Vec<(String, Vec<String>)>,
-    ) {
+    fn collect_rules(&self, node: &IpNode, prefix: String, output: &mut Vec<(String, Vec<IpNet>)>) {
         if let Some(ips) = &node.ips {
             let path = if prefix.is_empty() {
                 "/".to_string()
             } else {
                 format!("/{prefix}")
             };
-            output.push((path, ips.iter().map(|v| v.to_string()).collect()));
+            output.push((path, ips.clone()));
         }
         for (name, child) in &node.children {
             let next = if prefix.is_empty() {
@@ -304,6 +306,103 @@ impl IpWhitelist {
             self.collect_rules(child, next, output);
         }
     }
+
+    /// The node stored for `path` and the keys leading to it, resolved the way
+    /// [`Self::find`] resolves it. `None` when the tree has no node at or
+    /// below `path`, which also means there is no rule there.
+    async fn resolve(&self, path: &str, root: Option<&Path>) -> Option<(&IpNode, Vec<String>)> {
+        let parts: Vec<&str> = path
+            .trim_matches('/')
+            .split('/')
+            .filter(|v| !v.is_empty())
+            .collect();
+        let mut node = &self.root;
+        let mut keys: Vec<String> = vec![];
+        for (i, name) in parts.iter().enumerate() {
+            let key = resolve_child_key(&node.children, name, &parts[..i], root).await?;
+            node = node.children.get(&key)?;
+            keys.push(key);
+        }
+        Some((node, keys))
+    }
+
+    /// Whether a rule is configured at or below `path`.
+    pub async fn has_rules(&self, path: &str, root: Option<&Path>) -> bool {
+        self.resolve(path, root)
+            .await
+            .is_some_and(|(node, _)| node_has_rules(node))
+    }
+
+    /// Move the rules at `from` and below to `to`, keeping their structure.
+    /// Returns the number of moved rules. A rename must not drop a rule, or a
+    /// blocked subtree would become reachable at its new path.
+    pub async fn rename(&mut self, from: &str, to: &str, root: Option<&Path>) -> usize {
+        let Some((_, keys)) = self.resolve(from, root).await else {
+            return 0;
+        };
+        let src = format!("/{}", keys.join("/"));
+        let src = src.trim_end_matches('/');
+        let to = to.trim_matches('/');
+        let mut moved: Vec<(String, String, Vec<IpNet>)> = vec![];
+        for (path, ips) in self.rule_nodes() {
+            let suffix = if src.is_empty() {
+                path.trim_start_matches('/')
+            } else if path == src {
+                ""
+            } else {
+                match path.strip_prefix(src).and_then(|v| v.strip_prefix('/')) {
+                    Some(suffix) => suffix,
+                    None => continue,
+                }
+            };
+            let target = match (to.is_empty(), suffix.is_empty()) {
+                (true, true) => "/".to_string(),
+                (true, false) => format!("/{suffix}"),
+                (false, true) => format!("/{to}"),
+                (false, false) => format!("/{to}/{suffix}"),
+            };
+            moved.push((path, target, ips));
+        }
+        for (path, _, _) in &moved {
+            self.remove(path);
+        }
+        let count = moved.len();
+        for (_, target, ips) in moved {
+            self.insert(&target, ips);
+        }
+        count
+    }
+
+    /// Remove the rules at `path` and below, used when the content they
+    /// describe is deleted. Returns the number of removed rules.
+    pub async fn remove_tree(&mut self, path: &str, root: Option<&Path>) -> usize {
+        let Some((_, keys)) = self.resolve(path, root).await else {
+            return 0;
+        };
+        let src = format!("/{}", keys.join("/"));
+        let src = src.trim_end_matches('/');
+        let targets: Vec<String> = self
+            .rule_nodes()
+            .into_iter()
+            .map(|(path, _)| path)
+            .filter(|path| {
+                if src.is_empty() {
+                    true
+                } else {
+                    path.as_str() == src
+                        || path.strip_prefix(src).is_some_and(|v| v.starts_with('/'))
+                }
+            })
+            .collect();
+        for path in &targets {
+            self.remove(path);
+        }
+        targets.len()
+    }
+}
+
+fn node_has_rules(node: &IpNode) -> bool {
+    node.ips.is_some() || node.children.values().any(node_has_rules)
 }
 
 /// Deserialize the ip-whitelist configuration value.
@@ -375,6 +474,46 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_remove_tree_drops_the_subtree_only() {
+        let mut whitelist = IpWhitelist::default();
+        whitelist
+            .insert_ips("/team/secret", &["10.0.0.0/8".to_string()])
+            .unwrap();
+        whitelist.insert_ips("/team", &[]).unwrap();
+        whitelist.insert_ips("/team2", &[]).unwrap();
+
+        assert_eq!(whitelist.remove_tree("/team", None).await, 2);
+        assert!(!whitelist.has_rules("/team", None).await);
+        assert!(whitelist.has_rules("/team2", None).await);
+        assert_eq!(whitelist.rules(), vec![("/team2".to_string(), vec![])]);
+        assert_eq!(whitelist.remove_tree("/missing", None).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_rename_moves_the_rule_subtree() {
+        let mut whitelist = IpWhitelist::default();
+        whitelist
+            .insert_ips("/team/secret", &["10.0.0.0/8".to_string()])
+            .unwrap();
+        whitelist.insert_ips("/other", &[]).unwrap();
+
+        assert!(whitelist.has_rules("/team", None).await);
+        assert_eq!(whitelist.rename("/team", "/team2", None).await, 1);
+        // the rule followed the content
+        assert!(!whitelist.has_rules("/team", None).await);
+        assert!(whitelist.has_rules("/team2/secret", None).await);
+        assert_eq!(
+            whitelist.rules(),
+            vec![
+                ("/other".to_string(), vec![]),
+                ("/team2/secret".to_string(), vec!["10.0.0.0/8".to_string()]),
+            ]
+        );
+        // the source without rules moves nothing
+        assert_eq!(whitelist.rename("/missing", "/x", None).await, 0);
     }
 
     #[test]

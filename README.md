@@ -355,6 +355,10 @@ Besides client addresses, a path can carry per-user read/write rules. They are e
 
 The acl is evaluated per user: the nearest ancestor rule that mentions the user wins, so a child rule only needs to list the users it changes. A path inside a managed subtree that never mentions the user defaults to deny; a path with no rule at all falls back to `--auth`. When the lists conflict, deny beats write and write beats read. A user listed in `allow_read`/`allow_write` gets access even when `--auth` does not grant it, and `deny_read` wins over an `--auth` grant. The `guest` identity may be listed as a normal username to control unauthenticated visitors.
 
+The ancestors of a granted path stay reachable: when a rule below a directory grants the user access but no rule grants the directory itself, the directory becomes *traversable*. It is listed on the way down and can be opened, but it only lists its granted entries, it is read-only (no upload, rename or delete), and it is never granted on a file. An explicit `deny_read` on an ancestor does not hide a grant below it, since the grant could not be reached otherwise. With `--render-index` / `--render-try-index`, a traversable directory whose `index.html` is not readable shows that filtered listing instead of returning `403`.
+
+The rules follow a rename: a `MOVE` carries the rules of the moved path and of every path below it to the new location, for both the acl and the ip whitelist. Without that, a rename would drop a `deny_read` inside the moved directory and the content would silently inherit the destination's rule instead (exposing a path the user was denied). Moving onto a path that already carries rules of its own is refused with `409 Conflict` rather than merging two rule sets. Deleting a path drops the rules that describe it and its descendants, so an entry created at the same path later starts from the inherited rule instead of a stale one. `COPY` creates a new entry and therefore only inherits the destination's rules.
+
 Editing the acl requires the `x` permission for the target path (and `--allow-ip-whitelist`):
 
 ```sh

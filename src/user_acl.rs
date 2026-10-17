@@ -1,4 +1,4 @@
-use crate::auth::find_child_alias;
+use crate::auth::{find_child_alias, resolve_child_key};
 
 use anyhow::{Context, Result};
 use indexmap::IndexMap;
@@ -50,6 +50,12 @@ impl EffectiveRule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AclPerm {
     Deny,
+    /// The user may not read this directory, but a rule below it grants the
+    /// user access to something inside: the directory is only walkable, so
+    /// the granted entries stay reachable from the file list. It never allows
+    /// writing, listing an entry that is not itself granted, or reading a
+    /// file (a file has no descendants).
+    Traverse,
     Read,
     Write,
 }
@@ -211,17 +217,28 @@ impl UserAcl {
     /// user wins, so a child rule only needs to list the users it changes.
     /// `None` means no rule covers the path, so `--auth` applies; a path in a
     /// managed subtree that never mentions the user defaults to deny.
+    ///
+    /// A denied directory becomes [`AclPerm::Traverse`] when a rule below it
+    /// grants the user: without that, a grant on `/a/b/c` would be unreachable
+    /// from the file list because `/a` and `/a/b` could not be entered.
     pub async fn perm(&self, path: &str, user: &str, root: Option<&Path>) -> Option<AclPerm> {
         let parts = split_path(path);
         let mut node = &self.root;
         let mut managed = node.rule.is_some();
         let mut user_rule = node.rule.as_ref().filter(|rule| mentions(rule, user));
+        // Whether every component of the path exists in the acl tree. A path
+        // that leaves the tree has no rule below it, so it must not inherit a
+        // traversal from a sibling that happens to share the prefix.
+        let mut matched = true;
         for (i, name) in parts.iter().enumerate() {
             let child = match node.children.get(*name) {
                 Some(child) => child,
                 None => match find_child_alias(&node.children, name, &parts[..i], root).await {
                     Some(child) => child,
-                    None => break,
+                    None => {
+                        matched = false;
+                        break;
+                    }
                 },
             };
             node = child;
@@ -234,18 +251,27 @@ impl UserAcl {
                 }
             }
         }
-        let Some(rule) = user_rule else {
-            return if managed { Some(AclPerm::Deny) } else { None };
+        let perm = match user_rule {
+            None if !managed => return None,
+            None => AclPerm::Deny,
+            Some(rule) => {
+                if EffectiveRule::contains(&rule.deny_read, user) {
+                    // An explicit deny wins for this path, but it cannot hide a
+                    // grant below: the traversal check below still applies.
+                    AclPerm::Deny
+                } else if EffectiveRule::contains(&rule.allow_write, user) {
+                    AclPerm::Write
+                } else if EffectiveRule::contains(&rule.allow_read, user) {
+                    AclPerm::Read
+                } else {
+                    AclPerm::Deny
+                }
+            }
         };
-        if EffectiveRule::contains(&rule.deny_read, user) {
-            Some(AclPerm::Deny)
-        } else if EffectiveRule::contains(&rule.allow_write, user) {
-            Some(AclPerm::Write)
-        } else if EffectiveRule::contains(&rule.allow_read, user) {
-            Some(AclPerm::Read)
-        } else {
-            Some(AclPerm::Deny)
+        if perm == AclPerm::Deny && matched && descendant_allows(node, user) {
+            return Some(AclPerm::Traverse);
         }
+        Some(perm)
     }
 
     /// The users that can read/write `path`, annotated with whether the
@@ -287,7 +313,9 @@ impl UserAcl {
                 } else {
                     AclMemberKind::Full
                 }),
-                _ => {
+                // A traverse-only path (and an implicit deny) is an exception:
+                // the user only reaches something below it.
+                Some(AclPerm::Deny | AclPerm::Traverse) | None => {
                     if below_read || below_write {
                         Some(AclMemberKind::Exception)
                     } else {
@@ -301,7 +329,7 @@ impl UserAcl {
                 } else {
                     AclMemberKind::Full
                 }),
-                _ => {
+                Some(AclPerm::Read | AclPerm::Deny | AclPerm::Traverse) | None => {
                     if below_write {
                         Some(AclMemberKind::Exception)
                     } else {
@@ -342,6 +370,101 @@ impl UserAcl {
             };
         }
         Some(node)
+    }
+
+    /// The literal path this tree stores for `path`, resolved the way
+    /// [`Self::perm`] resolves it. `None` when the tree has no node at or
+    /// below `path`, which also means there is no rule to move.
+    async fn stored_path(&self, path: &str, root: Option<&Path>) -> Option<String> {
+        let parts = split_path(path);
+        let mut node = &self.root;
+        let mut keys: Vec<String> = vec![];
+        for (i, name) in parts.iter().enumerate() {
+            let key = resolve_child_key(&node.children, name, &parts[..i], root).await?;
+            node = node.children.get(&key)?;
+            keys.push(key);
+        }
+        Some(format!("/{}", keys.join("/")))
+    }
+
+    /// Whether a rule is configured at or below `path`.
+    pub async fn has_rules(&self, path: &str, root: Option<&Path>) -> bool {
+        match self.find_node(path, root).await {
+            Some(node) => node_has_rules(node),
+            None => false,
+        }
+    }
+
+    /// Move the rules at `from` and below to `to`, keeping their structure.
+    /// Returns the number of moved rules.
+    ///
+    /// A rename must not drop a rule: the content would land under a different
+    /// ancestor and silently inherit its permission instead of the configured
+    /// one (for example a `deny_read` inside the moved directory would stop
+    /// applying, exposing it to the user that was denied).
+    pub async fn rename(&mut self, from: &str, to: &str, root: Option<&Path>) -> usize {
+        let Some(stored) = self.stored_path(from, root).await else {
+            return 0;
+        };
+        let src = stored.trim_end_matches('/');
+        let to = to.trim_matches('/');
+        let mut moved: Vec<(String, String, UserRule)> = vec![];
+        for (path, rule) in self.rules() {
+            let suffix = if src.is_empty() {
+                // moving the served root cannot happen over http; keep the
+                // rule paths as they are below the new prefix
+                path.trim_start_matches('/')
+            } else if path == src {
+                ""
+            } else {
+                match path.strip_prefix(src).and_then(|v| v.strip_prefix('/')) {
+                    Some(suffix) => suffix,
+                    None => continue,
+                }
+            };
+            let target = match (to.is_empty(), suffix.is_empty()) {
+                (true, true) => "/".to_string(),
+                (true, false) => format!("/{suffix}"),
+                (false, true) => format!("/{to}"),
+                (false, false) => format!("/{to}/{suffix}"),
+            };
+            moved.push((path, target, rule));
+        }
+        for (path, _, _) in &moved {
+            self.remove(path);
+        }
+        let count = moved.len();
+        for (_, target, rule) in moved {
+            self.insert(&target, rule);
+        }
+        count
+    }
+
+    /// Remove the rules at `path` and below, used when the content they
+    /// describe is deleted. Returns the number of removed rules: a later entry
+    /// created at the same path must not inherit rules nobody configured for it.
+    pub async fn remove_tree(&mut self, path: &str, root: Option<&Path>) -> usize {
+        let Some(stored) = self.stored_path(path, root).await else {
+            return 0;
+        };
+        let src = stored.trim_end_matches('/');
+        let targets: Vec<String> = self
+            .rules()
+            .into_iter()
+            .map(|(path, _)| path)
+            .filter(|path| {
+                if src.is_empty() {
+                    true
+                } else {
+                    path.as_str() == src
+                        || path.strip_prefix(src).is_some_and(|v| v.starts_with('/'))
+                }
+            })
+            .collect();
+        for path in &targets {
+            self.remove(path);
+        }
+        targets.len()
     }
 
     #[allow(dead_code)]
@@ -393,6 +516,24 @@ fn collect_descendant_users(node: &UserNode, out: &mut BTreeSet<String>) {
     for child in node.children.values() {
         collect_descendant_users(child, out);
     }
+}
+
+/// Whether any rule strictly below `node` grants `user` read or write.
+/// A rule that also denies the user does not count: the deny would win at
+/// that path, so there is nothing to walk to.
+/// Whether a rule is configured on `node` or anywhere below it.
+fn node_has_rules(node: &UserNode) -> bool {
+    node.rule.is_some() || node.children.values().any(node_has_rules)
+}
+
+fn descendant_allows(node: &UserNode, user: &str) -> bool {
+    node.children.values().any(|child| {
+        child.rule.as_ref().is_some_and(|rule| {
+            !EffectiveRule::contains(&rule.deny_read, user)
+                && (EffectiveRule::contains(&rule.allow_read, user)
+                    || EffectiveRule::contains(&rule.allow_write, user))
+        }) || descendant_allows(child, user)
+    })
 }
 
 fn descendant_mentions(node: &UserNode, user: &str) -> (bool, bool, bool) {
@@ -663,6 +804,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rename_moves_the_rule_subtree() {
+        let mut acl = UserAcl::default();
+        acl.insert("/", rule(&["bob"], &[], &[]));
+        acl.insert("/team", rule(&["alice"], &[], &[]));
+        acl.insert("/team/secret", rule(&[], &[], &["alice"]));
+        acl.insert("/team/secret/sub", rule(&["carol"], &[], &[]));
+
+        assert!(acl.has_rules("/team", None).await);
+        assert!(!acl.has_rules("/team2", None).await);
+
+        assert_eq!(acl.rename("/team", "/team2", None).await, 3);
+        // the rules moved with the content
+        assert_eq!(acl.perm("/team2", "alice", None).await, Some(AclPerm::Read));
+        assert_eq!(
+            acl.perm("/team2/secret", "alice", None).await,
+            Some(AclPerm::Deny)
+        );
+        assert_eq!(
+            acl.perm("/team2/secret/sub", "carol", None).await,
+            Some(AclPerm::Read)
+        );
+        // and no longer apply below the old path
+        assert!(!acl.has_rules("/team", None).await);
+        assert!(!acl.has_rules("/team/secret", None).await);
+        // the root rule is untouched
+        assert_eq!(
+            acl.perm("/anything", "bob", None).await,
+            Some(AclPerm::Read)
+        );
+
+        // a source without rules moves nothing, a leaf rule moves as a whole
+        assert_eq!(acl.rename("/nowhere", "/elsewhere", None).await, 0);
+        acl.insert("/a.txt", rule(&["dave"], &[], &[]));
+        assert_eq!(acl.rename("/a.txt", "/b.txt", None).await, 1);
+        assert_eq!(acl.perm("/b.txt", "dave", None).await, Some(AclPerm::Read));
+        assert!(!acl.has_rules("/a.txt", None).await);
+    }
+
+    #[tokio::test]
+    async fn test_remove_tree_drops_the_subtree_only() {
+        let mut acl = UserAcl::default();
+        acl.insert("/", rule(&["bob"], &[], &[]));
+        acl.insert("/team", rule(&["alice"], &[], &[]));
+        acl.insert("/team/secret", rule(&[], &[], &["alice"]));
+        acl.insert("/team2", rule(&["carol"], &[], &[]));
+
+        assert_eq!(acl.remove_tree("/team", None).await, 2);
+        assert!(!acl.has_rules("/team", None).await);
+        assert!(!acl.has_rules("/team/secret", None).await);
+        // a sibling that only shares the prefix is kept
+        assert!(acl.has_rules("/team2", None).await);
+        assert_eq!(acl.perm("/team2", "carol", None).await, Some(AclPerm::Read));
+        // the root rule is kept, so a recreated path inherits it instead of
+        // inheriting rules that described the deleted content
+        assert_eq!(acl.perm("/team", "alice", None).await, Some(AclPerm::Deny));
+        assert_eq!(acl.remove_tree("/missing", None).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_traverse_reaches_grants_below() {
+        let mut acl = UserAcl::default();
+        // the root only lists bob, so alice has no read on it
+        acl.insert("/", rule(&["bob"], &[], &[]));
+        acl.insert("/team/alpha", rule(&["alice"], &[], &[]));
+
+        // the ancestors of alice's grant are walkable but never readable
+        assert_eq!(acl.perm("/", "alice", None).await, Some(AclPerm::Traverse));
+        assert_eq!(
+            acl.perm("/team", "alice", None).await,
+            Some(AclPerm::Traverse)
+        );
+        assert_eq!(
+            acl.perm("/team/alpha", "alice", None).await,
+            Some(AclPerm::Read)
+        );
+        // a sibling without a grant stays denied
+        assert_eq!(
+            acl.perm("/team/beta", "alice", None).await,
+            Some(AclPerm::Deny)
+        );
+        // bob reads the root normally, carol is granted nowhere
+        assert_eq!(acl.perm("/team", "bob", None).await, Some(AclPerm::Read));
+        assert_eq!(acl.perm("/team", "carol", None).await, Some(AclPerm::Deny));
+
+        // a path that leaves the acl tree does not inherit the traversal of a
+        // sibling that shares its prefix
+        acl.insert("/a/c", rule(&["alice"], &[], &[]));
+        assert_eq!(acl.perm("/a/b", "alice", None).await, Some(AclPerm::Deny));
+
+        // write implies read, so a write grant also makes its ancestors
+        // walkable
+        acl.insert("/drop", rule(&[], &["alice"], &[]));
+        assert_eq!(acl.perm("/drop", "alice", None).await, Some(AclPerm::Write));
+
+        // an explicit deny on the ancestor does not hide the grant below it,
+        // otherwise the grant could not be reached at all
+        acl.insert(
+            "/secret",
+            UserRule {
+                deny_read: Some(list(&["alice"])),
+                ..Default::default()
+            },
+        );
+        acl.insert("/secret/open", rule(&["alice"], &[], &[]));
+        assert_eq!(
+            acl.perm("/secret", "alice", None).await,
+            Some(AclPerm::Traverse)
+        );
+        assert_eq!(
+            acl.perm("/secret/closed", "alice", None).await,
+            Some(AclPerm::Deny)
+        );
+
+        // no acl at all still falls back to --auth
+        assert_eq!(UserAcl::default().perm("/", "alice", None).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_traverse_is_independent_of_aliases() {
+        let dir = assert_fs::TempDir::new().unwrap();
+        let root = dir.path();
+        let mut acl = UserAcl::default();
+        acl.insert("/", rule(&["bob"], &[], &[]));
+        // the rule is stored with the on-disk name, the request may use another
+        // case: traversal has to follow the alias lookup as well
+        dir.child("Team/Alpha").create_dir_all().unwrap();
+        acl.insert("/team/alpha", rule(&["alice"], &[], &[]));
+        let folds_case = root.join("Team").is_dir();
+        assert_eq!(
+            acl.perm("Team", "alice", Some(root)).await,
+            if folds_case {
+                Some(AclPerm::Traverse)
+            } else {
+                Some(AclPerm::Deny)
+            }
+        );
+        assert_eq!(
+            acl.perm("Team/Alpha", "alice", Some(root)).await,
+            if folds_case {
+                Some(AclPerm::Read)
+            } else {
+                Some(AclPerm::Deny)
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_follows_aliases() {
+        let dir = assert_fs::TempDir::new().unwrap();
+        let root = dir.path();
+        dir.child("Team/Secret").create_dir_all().unwrap();
+        let mut acl = UserAcl::default();
+        // the rule keeps the spelling it was configured with
+        acl.insert("/team/secret", rule(&["alice"], &[], &[]));
+        let folds_case = root.join("Team").is_dir();
+        let moved = acl.rename("Team", "Team2", Some(root)).await;
+        if folds_case {
+            assert_eq!(moved, 1);
+            // the rename creates the path the rules were moved to
+            dir.child("Team2/Secret").create_dir_all().unwrap();
+            assert_eq!(
+                acl.perm("Team2/Secret", "alice", Some(root)).await,
+                Some(AclPerm::Read)
+            );
+        } else {
+            // a case sensitive filesystem has no alias: nothing is moved
+            assert_eq!(moved, 0);
+            assert_eq!(
+                acl.perm("Team2/Secret", "alice", Some(root)).await,
+                Some(AclPerm::Deny)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_summary_kinds() {
         let mut acl = UserAcl::default();
         acl.insert("/", rule(&["alice"], &["bob"], &[]));
@@ -721,7 +1037,8 @@ mod tests {
 
         assert_eq!(acl.perm("/", "alice", None).await, Some(AclPerm::Read));
         assert_eq!(acl.perm("/", "bob", None).await, Some(AclPerm::Write));
-        assert_eq!(acl.perm("/", "carol", None).await, Some(AclPerm::Deny));
+        // carol is only granted below, so the root is walkable but not readable
+        assert_eq!(acl.perm("/", "carol", None).await, Some(AclPerm::Traverse));
 
         // alice is denied by the nearest rule that mentions her
         assert_eq!(
@@ -746,7 +1063,12 @@ mod tests {
         // dave is allowed on /other; alice falls back to the root
         assert_eq!(acl.perm("/other", "dave", None).await, Some(AclPerm::Read));
         assert_eq!(acl.perm("/other", "alice", None).await, Some(AclPerm::Read));
+        // carol's only grant is /secret/open, which is not under /other
         assert_eq!(acl.perm("/other", "carol", None).await, Some(AclPerm::Deny));
+        assert_eq!(
+            acl.perm("/secret", "carol", None).await,
+            Some(AclPerm::Traverse)
+        );
         assert_eq!(acl.perm("/other", "erin", None).await, Some(AclPerm::Deny));
 
         // no rules at all -> --auth fallback

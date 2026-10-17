@@ -25,9 +25,11 @@ fn cors(#[with(&["--enable-cors"])] server: TestServer) -> Result<(), Error> {
         resp.headers().get("access-control-allow-headers").unwrap(),
         "Authorization,*"
     );
+    // the diagnostics header is exposed as well so a browser client can read
+    // the resolved client address
     assert_eq!(
         resp.headers().get("access-control-expose-headers").unwrap(),
-        "Authorization,*"
+        "Authorization,*,x-client-ip"
     );
     Ok(())
 }

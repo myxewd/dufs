@@ -377,13 +377,16 @@ impl Server {
             let acl = self.acl_perm(&relative_path, &acl_user).await;
             let method_is_write = !is_readonly_method(&method);
             if matches!(acl, Some(AclPerm::Deny))
-                || (matches!(acl, Some(AclPerm::Read)) && method_is_write)
+                || (matches!(acl, Some(AclPerm::Read | AclPerm::Traverse)) && method_is_write)
             {
                 status_forbid(&mut res);
                 return Ok(res);
             }
             match acl {
-                Some(AclPerm::Read) => {
+                // A traversable directory only lets the user walk to a granted
+                // child: the listing filters the entries, and the page stays
+                // read-only so nothing can be created, renamed or deleted here.
+                Some(AclPerm::Read | AclPerm::Traverse) => {
                     let mut ap = access_paths.unwrap_or_default();
                     ap.set_perm(AccessPerm::ReadOnly);
                     Some(ap)
@@ -854,13 +857,58 @@ impl Server {
     }
 
     async fn handle_delete(&self, path: &Path, is_dir: bool, res: &mut Response) -> Result<()> {
+        // The permissions describing a path go away with it, so an entry
+        // created at the same path later does not silently inherit rules that
+        // nobody configured for it.
+        let from = path
+            .strip_prefix(&self.args.serve_path)
+            .map(normalize_path)
+            .unwrap_or_default();
+        let root = Some(self.args.serve_path.as_path());
+        let mut acl = (*self.user_acl_snapshot()).clone();
+        let mut whitelist = (*self.whitelist_snapshot()).clone();
+        let acl_removed = acl.remove_tree(&from, root).await;
+        let ips_removed = whitelist.remove_tree(&from, root).await;
+
         match is_dir {
             true => fs::remove_dir_all(path).await?,
             false => fs::remove_file(path).await?,
         }
 
+        if (acl_removed > 0 || ips_removed > 0)
+            && !self.store_permissions(acl, whitelist, res).await
+        {
+            return Ok(());
+        }
+
         status_no_content(res);
         Ok(())
+    }
+
+    /// Persist both permission stores and publish them to the running server.
+    /// On failure the response is set and `false` is returned, leaving the
+    /// in-memory stores untouched so they keep matching the disk.
+    async fn store_permissions(
+        &self,
+        acl: UserAcl,
+        whitelist: IpWhitelist,
+        res: &mut Response,
+    ) -> bool {
+        if let Err(err) = ip_whitelist_store::save(&self.args.serve_path, &whitelist) {
+            error!("Failed to save permissions, {err}");
+            *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            *res.body_mut() = body_full(format!("Failed to save permissions, {err}"));
+            return false;
+        }
+        if let Err(err) = user_acl::save(&self.args.serve_path, &acl) {
+            error!("Failed to save permissions, {err}");
+            *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            *res.body_mut() = body_full(format!("Failed to save permissions, {err}"));
+            return false;
+        }
+        *self.ip_whitelist.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(whitelist);
+        *self.user_acl.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(acl);
+        true
     }
 
     async fn handle_ls_dir(
@@ -1068,7 +1116,24 @@ impl Server {
             // The index file is served on behalf of the directory, so its own
             // acl entry has to be honored as well.
             if !self.file_acl_allows(&index_path, acl_user).await {
-                status_forbid(res);
+                if self.dir_traversable(path, acl_user).await {
+                    // A user that may only walk this directory cannot read its
+                    // index page, but has to be able to reach a granted child:
+                    // show the filtered listing instead of a dead end.
+                    self.handle_ls_dir(
+                        path,
+                        true,
+                        query_params,
+                        head_only,
+                        user,
+                        access_paths,
+                        ip,
+                        res,
+                    )
+                    .await?;
+                } else {
+                    status_forbid(res);
+                }
                 return Ok(());
             }
             self.handle_send_file(&index_path, headers, head_only, res)
@@ -1704,9 +1769,47 @@ impl Server {
             return Ok(());
         }
 
+        // Permissions are stored per path, so they have to move with the
+        // content: otherwise a deny inside the moved directory would stay
+        // behind and the content would silently inherit the destination's
+        // rule instead (exposing a path the user was denied).
+        let from = path
+            .strip_prefix(&self.args.serve_path)
+            .map(normalize_path)
+            .unwrap_or_default();
+        let to = dest
+            .strip_prefix(&self.args.serve_path)
+            .map(normalize_path)
+            .unwrap_or_default();
+        let root = Some(self.args.serve_path.as_path());
+        let mut acl = (*self.user_acl_snapshot()).clone();
+        let mut whitelist = (*self.whitelist_snapshot()).clone();
+        // Moving a path onto itself leaves everything where it is.
+        let (acl_moved, ips_moved) = if from == to {
+            (0, 0)
+        } else {
+            let dest_taken = acl.has_rules(&to, root).await || whitelist.has_rules(&to, root).await;
+            let acl_moved = acl.rename(&from, &to, root).await;
+            let ips_moved = whitelist.rename(&from, &to, root).await;
+            if (acl_moved > 0 || ips_moved > 0) && dest_taken {
+                *res.status_mut() = StatusCode::CONFLICT;
+                *res.body_mut() = body_full(
+                    "Destination already has permissions configured, remove them or move the entry elsewhere",
+                );
+                return Ok(());
+            }
+            (acl_moved, ips_moved)
+        };
+
         ensure_path_parent(&dest).await?;
 
+        // The rules live in the local copies until the filesystem move
+        // succeeded, so a failed rename changes nothing.
         fs::rename(path, &dest).await?;
+
+        if (acl_moved > 0 || ips_moved > 0) && !self.store_permissions(acl, whitelist, res).await {
+            return Ok(());
+        }
 
         status_no_content(res);
         Ok(())
@@ -2179,17 +2282,42 @@ impl Server {
             .strip_prefix(&self.args.serve_path)
             .map(normalize_path)
             .unwrap_or_default();
+        // `None` means no rule covers the file, so `--auth` (already enforced)
+        // decides; only an explicit deny or a traversal-only ancestor refuses.
         !matches!(
             self.acl_perm(&rel_path, acl_user).await,
-            Some(AclPerm::Deny)
+            Some(AclPerm::Deny | AclPerm::Traverse)
         )
+    }
+
+    /// Whether the user may only walk `path`, i.e. the acl grants something
+    /// below the directory but not the directory itself.
+    async fn dir_traversable(&self, path: &Path, acl_user: &str) -> bool {
+        let rel_path = path
+            .strip_prefix(&self.args.serve_path)
+            .map(normalize_path)
+            .unwrap_or_default();
+        self.acl_perm(&rel_path, acl_user).await == Some(AclPerm::Traverse)
     }
 
     /// The user acl decision for a path relative to the serve root.
     async fn acl_perm(&self, path: &str, user: &str) -> Option<AclPerm> {
-        self.user_acl_snapshot()
+        let perm = self
+            .user_acl_snapshot()
             .perm(path, user, Some(&self.args.serve_path))
-            .await
+            .await;
+        // A traversal is the permission to walk *through* a directory, so it
+        // must never apply to a file: a rule below a file path is a
+        // misconfiguration, not a read grant.
+        if perm == Some(AclPerm::Traverse)
+            && !fs::metadata(self.args.serve_path.join(path))
+                .await
+                .map(|v| v.is_dir())
+                .unwrap_or_default()
+        {
+            return Some(AclPerm::Deny);
+        }
+        perm
     }
 
     /// Whether the user may write the parent directory of a path. This backs
@@ -2259,7 +2387,7 @@ impl Server {
             .acl_perm(path, user.as_deref().unwrap_or("guest"))
             .await
         {
-            Some(AclPerm::Deny) => false,
+            Some(AclPerm::Deny | AclPerm::Traverse) => false,
             Some(AclPerm::Read) => is_readonly_method(req.method()),
             Some(AclPerm::Write) => true,
             None => access_paths.is_some(),
@@ -2750,8 +2878,11 @@ impl Server {
                 .await
                 .is_some();
             let allowed = match acl {
+                // A traversable directory is listed so the granted child stays
+                // reachable from the file list; its own entries are filtered
+                // the same way when the user opens it.
                 Some(AclPerm::Deny) => false,
-                Some(AclPerm::Read | AclPerm::Write) => true,
+                Some(AclPerm::Read | AclPerm::Write | AclPerm::Traverse) => true,
                 None => native,
             };
             if !allowed {
@@ -3372,7 +3503,10 @@ where
                     .is_some();
                 let allowed = match acl {
                     Some(AclPerm::Deny) => false,
+                    // Descend into a traversable directory so search and
+                    // archives can reach the entries granted below it.
                     Some(AclPerm::Read | AclPerm::Write) => true,
+                    Some(AclPerm::Traverse) => is_dir,
                     None => native,
                 };
                 if !allowed {
