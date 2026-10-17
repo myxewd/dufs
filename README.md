@@ -249,6 +249,8 @@ dufs -a user:pass@/:rw,/dir1 -a @/
 - `-a user:pass@/:rw,/dir1`: `user` has read-write permissions for `/*`, has read-only permissions for `/dir1/*`.
 - `-a @/`: All paths is publicly accessible, everyone can view/download it.
 
+A request without credentials is treated as the `guest` identity: if `--auth` defines a `guest` account its permissions apply, otherwise the anonymous `@/` rule is used. The **Login** button in the top-right navigates to `?login`, which starts the configured authentication — the browser's Basic/Digest prompt for `builtin`, or a redirect to the provider for `oidc`.
+
 **Auth permissions are restricted by dufs global permissions.** If dufs does not enable upload permissions via `--allow-upload`, then the account will not have upload permissions even if it is granted `read-write`(`:rw`) permissions.
 
 #### Hashed Password
@@ -293,7 +295,7 @@ Dufs can delegate authentication to an OpenID Connect provider. Select the adapt
 
 ```sh
 export DUFS_AUTH_TYPE=oidc
-export DUFS_AUTH='alice:unused@/:rw|bob:unused@/public'
+export DUFS_AUTH='guest:unused@/:ro|alice:unused@/:rw|bob:unused@/public'
 export DUFS_OIDC_ISSUER=https://sso.example.com
 export DUFS_OIDC_CLIENT_ID=dufs
 export DUFS_OIDC_CLIENT_SECRET=change-me
@@ -303,7 +305,7 @@ dufs
 
 The identity is the `preferred_username` claim by default — not `name` or `nickname`. Set `DUFS_OIDC_USERNAME_CLAIM` if your provider exposes the login name under another claim (for example `username` or `email`). A user who authenticates successfully but is absent from `DUFS_AUTH` gets no access. Anonymous access (`@/`) still applies if configured.
 
-Requests without a session are redirected to the provider; after the callback a session cookie is set and the original path is restored. Sessions live in memory, so restarting dufs signs everyone out. The callback endpoint is `__dufs__/oidc/callback` under the configured path prefix.
+Without a session the visitor is the `guest` identity. If `guest` (or an anonymous `@/` rule) is configured the page loads and the top-right **Login** button redirects to the provider; otherwise requests are redirected automatically. After the callback a session cookie is set and the original path is restored. Sessions live in memory, so restarting dufs signs everyone out. The callback endpoint is `__dufs__/oidc/callback` under the configured path prefix.
 
 ### IP Whitelist
 

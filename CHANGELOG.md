@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file.
 - Store the IP whitelist in a `.dufs` metadata directory at the served root, which is never served
 - Add `--trusted-proxy` so the IP whitelist works behind a reverse proxy via `X-Forwarded-For`/`X-Real-IP`
 - Add an OIDC authentication adapter (`--auth-type oidc`), using the provider username with the existing `--auth` roles
+- Treat unauthenticated requests as a configurable `guest` identity, and add a Login button that starts the configured authentication
 
 ## [0.46.0] - 2026-05-07
 

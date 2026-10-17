@@ -261,6 +261,18 @@ svg {
 
 .login-btn {
   cursor: pointer;
+  display: flex;
+  align-items: center;
+}
+
+.login-btn span {
+  padding-left: 3px;
+}
+
+.guest-name {
+  padding-right: 0.5em;
+  font-size: 0.9em;
+  color: var(--text-secondary);
 }
 
 .save-btn {

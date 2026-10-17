@@ -639,3 +639,42 @@ fn token_auth_rejects(#[with(&["-a", "user:pass@/"])] server: TestServer) -> Res
 
     Ok(())
 }
+
+#[rstest]
+fn guest_is_the_default_identity(
+    #[with(&[
+        "--auth",
+        "guest:guest@/:ro",
+        "--auth",
+        "user:pass@/:rw",
+        "-A",
+    ])]
+    server: TestServer,
+) -> Result<(), Error> {
+    // unauthenticated requests use the guest identity (read-only)
+    let resp = reqwest::blocking::get(server.url())?;
+    assert_eq!(resp.status(), 200);
+    let resp = fetch!(b"GET", &format!("{}?json", server.url())).send()?;
+    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert_eq!(data["user"], serde_json::Value::Null);
+    assert_eq!(data["auth"], true);
+
+    // a guest write is challenged so the visitor can log in
+    let resp = fetch!(b"PUT", &format!("{}guest.txt", server.url()))
+        .body(b"abc".to_vec())
+        .send()?;
+    assert_eq!(resp.status(), 401);
+
+    // the login entry challenges unauthenticated requests
+    let resp = fetch!(b"GET", &format!("{}?login", server.url())).send()?;
+    assert_eq!(resp.status(), 401);
+
+    // valid credentials upgrade the identity
+    let resp = fetch!(b"GET", &format!("{}?json", server.url()))
+        .basic_auth("user", Some("pass"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert_eq!(data["user"], "user");
+    Ok(())
+}

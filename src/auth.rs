@@ -118,9 +118,14 @@ impl AccessControl {
         self.users.get(user).map(|(_, access_paths)| access_paths)
     }
 
-    /// The access paths granted to anonymous requests, if any.
-    pub fn anonymous_paths(&self) -> Option<&AccessPaths> {
-        self.anonymous.as_ref()
+    /// The access paths used by an unauthenticated visitor. A user named
+    /// `guest` is the default identity; the anonymous `@/` rule is the
+    /// fallback.
+    pub fn guest_paths(&self) -> Option<&AccessPaths> {
+        self.users
+            .get("guest")
+            .map(|(_, access_paths)| access_paths)
+            .or(self.anonymous.as_ref())
     }
 
     /// Returns the guarded `(user, access_paths, via_token)`. `via_token` is
@@ -171,7 +176,7 @@ impl AccessControl {
             return (None, Some(AccessPaths::new(AccessPerm::ReadOnly)), false);
         }
 
-        if let Some(ap) = self.anonymous.as_ref() {
+        if let Some(ap) = self.guest_paths() {
             return (None, ap.guard(path, method, Some(root)).await, false);
         }
 

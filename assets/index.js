@@ -619,17 +619,12 @@ async function setupAuth() {
     $logoutBtn.addEventListener("click", logout);
     $userName.textContent = DATA.user;
   } else {
+    // Unauthenticated visitors are the `guest` identity; the login button
+    // starts whichever authentication the server is configured for.
+    document.querySelector(".guest-name")?.classList.remove("hidden");
     $loginBtn.classList.remove("hidden");
-    $loginBtn.addEventListener("click", async () => {
-      if (DATA.auth_type === "oidc") {
-        const next = encodeURIComponent(location.pathname + location.search);
-        location.href = `${DATA.uri_prefix}__dufs__/oidc/login?next=${next}`;
-        return;
-      }
-      try {
-        await checkAuth("login");
-      } catch { }
-      location.reload();
+    $loginBtn.addEventListener("click", () => {
+      location.href = baseUrl() + "?login";
     });
   }
 }

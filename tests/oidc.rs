@@ -6,7 +6,7 @@ use fixtures::{port, tmpdir, wait_for_port, Error, Port};
 use rstest::rstest;
 use std::process::{Command, Stdio};
 
-fn start_oidc(tmpdir: &TempDir, port: &Port) -> Result<std::process::Child, Error> {
+fn start_oidc(tmpdir: &TempDir, port: &Port, auth: &str) -> Result<std::process::Child, Error> {
     let redirect = format!("http://localhost:{port}/__dufs__/oidc/callback");
     Ok(Command::new(assert_cmd::cargo::cargo_bin!())
         .arg(tmpdir.path())
@@ -15,7 +15,7 @@ fn start_oidc(tmpdir: &TempDir, port: &Port) -> Result<std::process::Child, Erro
         .arg("--auth-type")
         .arg("oidc")
         .arg("--auth")
-        .arg("user:pass@/:rw")
+        .arg(auth)
         .env_remove("DUFS_OIDC_ISSUER")
         .env("DUFS_OIDC_ISSUER", "http://127.0.0.1:1/")
         .env("DUFS_OIDC_CLIENT_ID", "dufs")
@@ -34,7 +34,7 @@ fn client() -> reqwest::blocking::Client {
 
 #[rstest]
 fn unauthenticated_redirects_to_login(tmpdir: TempDir, port: Port) -> Result<(), Error> {
-    let mut child = start_oidc(&tmpdir, &port)?;
+    let mut child = start_oidc(&tmpdir, &port, "user:pass@/:rw")?;
     wait_for_port(&port);
     let resp = client().get(format!("http://localhost:{port}/")).send()?;
     assert_eq!(resp.status(), 302);
@@ -49,7 +49,7 @@ fn unauthenticated_redirects_to_login(tmpdir: TempDir, port: Port) -> Result<(),
 
 #[rstest]
 fn login_endpoint_reports_unavailable_provider(tmpdir: TempDir, port: Port) -> Result<(), Error> {
-    let mut child = start_oidc(&tmpdir, &port)?;
+    let mut child = start_oidc(&tmpdir, &port, "user:pass@/:rw")?;
     wait_for_port(&port);
     let resp = client()
         .get(format!("http://localhost:{port}/__dufs__/oidc/login"))
@@ -61,7 +61,7 @@ fn login_endpoint_reports_unavailable_provider(tmpdir: TempDir, port: Port) -> R
 
 #[rstest]
 fn logout_clears_session_cookie(tmpdir: TempDir, port: Port) -> Result<(), Error> {
-    let mut child = start_oidc(&tmpdir, &port)?;
+    let mut child = start_oidc(&tmpdir, &port, "user:pass@/:rw")?;
     wait_for_port(&port);
     let resp = client()
         .get(format!("http://localhost:{port}/__dufs__/oidc/logout"))
@@ -111,5 +111,29 @@ fn oidc_requires_auth_users() -> Result<(), Error> {
         stderr.contains("requires at least one --auth rule"),
         "stderr: {stderr}"
     );
+    Ok(())
+}
+
+#[rstest]
+fn guest_page_and_login_redirect(tmpdir: TempDir, port: Port) -> Result<(), Error> {
+    let mut child = start_oidc(&tmpdir, &port, "guest:guest@/:ro|user:pass@/:rw")?;
+    wait_for_port(&port);
+
+    // the unauthenticated visitor is the guest identity, so the page loads
+    let resp = client().get(format!("http://localhost:{port}/")).send()?;
+    assert_eq!(resp.status(), 200);
+
+    // the login entry starts the configured oidc authentication
+    let resp = client()
+        .get(format!("http://localhost:{port}/?login"))
+        .send()?;
+    assert_eq!(resp.status(), 302);
+    let location = resp.headers().get("location").unwrap().to_str()?;
+    assert!(
+        location.starts_with("/__dufs__/oidc/login?next="),
+        "{location}"
+    );
+
+    child.kill()?;
     Ok(())
 }

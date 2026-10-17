@@ -275,6 +275,21 @@ impl Server {
             }
         }
 
+        // The top-right Login button navigates to `?login`, which starts the
+        // configured authentication instead of continuing as the guest.
+        if has_query_flag(&query_params, "login") {
+            if self.oidc.is_some() {
+                let next = urlencoding::encode(req_path.as_str());
+                let location = format!("{}__dufs__/oidc/login?next={next}", self.args.uri_prefix);
+                redirect(&mut res, &location);
+                return Ok(res);
+            }
+            if authorization.is_none() && self.args.auth.has_users() {
+                self.auth_reject(&mut res)?;
+                return Ok(res);
+            }
+        }
+
         let (user, access_paths, via_token) = if let Some(oidc) = &self.oidc {
             self.guard_oidc(oidc, headers, &relative_path, &method)
                 .await
@@ -294,13 +309,22 @@ impl Server {
 
         let (user, access_paths) = match (user, access_paths) {
             (None, None) => {
+                let guest = self.args.auth.guest_paths().is_some();
                 if self.oidc.is_some() {
-                    let next = urlencoding::encode(req_path.as_str());
-                    let location =
-                        format!("{}__dufs__/oidc/login?next={next}", self.args.uri_prefix);
-                    redirect(&mut res, &location);
+                    if guest {
+                        // The guest identity exists but this path is not granted
+                        // to it; the login button is available on allowed pages.
+                        status_forbid(&mut res);
+                    } else {
+                        let next = urlencoding::encode(req_path.as_str());
+                        let location =
+                            format!("{}__dufs__/oidc/login?next={next}", self.args.uri_prefix);
+                        redirect(&mut res, &location);
+                    }
                     return Ok(res);
                 }
+                // Builtin auth challenges the request so the browser can
+                // prompt for credentials, even when a guest identity exists.
                 self.auth_reject(&mut res)?;
                 return Ok(res);
             }
@@ -1680,7 +1704,7 @@ impl Server {
                 return (Some(username), None, false);
             }
         }
-        if let Some(access_paths) = self.args.auth.anonymous_paths() {
+        if let Some(access_paths) = self.args.auth.guest_paths() {
             let guarded = access_paths
                 .guard(path, method, Some(&self.args.serve_path))
                 .await;
