@@ -261,21 +261,24 @@ impl Server {
             return Ok(res);
         }
 
-        let ip_ok = self.ip_allowed(&relative_path, ip).await;
-        // The ip whitelist is the highest layer: it applies to guests, users and
-        // acl managers alike, including the acl browsing view.
-        if !ip_ok {
-            status_forbid(&mut res);
-            return Ok(res);
-        }
-
         // The management API is guarded by authentication rather than the ip
         // whitelist, so an administrator is never locked out of fixing a rule.
+        // It must be dispatched before the ip check: otherwise a wrong rule
+        // makes the api itself unreachable and the only fix is editing the
+        // json on disk.
         if relative_path == IP_WHITELIST_API_PATH {
             return self.handle_ip_whitelist(req, method).await;
         }
         if relative_path == ACL_API_PATH {
             return self.handle_acl(req, method).await;
+        }
+
+        let ip_ok = self.ip_allowed(&relative_path, ip).await;
+        // The ip whitelist is the highest layer for content: it applies to
+        // guests, users and acl managers alike, including the acl browsing view.
+        if !ip_ok {
+            status_forbid(&mut res);
+            return Ok(res);
         }
 
         let headers = req.headers();
@@ -567,6 +570,7 @@ impl Server {
                                 user,
                                 access_paths,
                                 ip,
+                                &acl_user,
                                 &mut res,
                             )
                             .await?;
@@ -580,6 +584,7 @@ impl Server {
                             user,
                             access_paths,
                             ip,
+                            &acl_user,
                             &mut res,
                         )
                         .await?;
@@ -634,8 +639,16 @@ impl Server {
                             .await?;
                     }
                 } else if render_spa {
-                    self.handle_render_spa(path, &query_params, headers, head_only, ip, &mut res)
-                        .await?;
+                    self.handle_render_spa(
+                        path,
+                        &query_params,
+                        headers,
+                        head_only,
+                        ip,
+                        &acl_user,
+                        &mut res,
+                    )
+                    .await?;
                 } else if allow_upload && req_path.ends_with('/') {
                     self.handle_ls_dir(
                         path,
@@ -1028,6 +1041,7 @@ impl Server {
         user: Option<String>,
         access_paths: AccessPaths,
         ip: Option<IpAddr>,
+        acl_user: &str,
         res: &mut Response,
     ) -> Result<()> {
         let index_path = path.join(INDEX_NAME);
@@ -1038,6 +1052,12 @@ impl Server {
             .unwrap_or_default()
         {
             if !self.entry_ip_allowed(&index_path, ip).await {
+                status_forbid(res);
+                return Ok(());
+            }
+            // The index file is served on behalf of the directory, so its own
+            // acl entry has to be honored as well.
+            if !self.file_acl_allows(&index_path, acl_user).await {
                 status_forbid(res);
                 return Ok(());
             }
@@ -1093,11 +1113,16 @@ impl Server {
         headers: &HeaderMap<HeaderValue>,
         head_only: bool,
         ip: Option<IpAddr>,
+        acl_user: &str,
         res: &mut Response,
     ) -> Result<()> {
         if path.extension().is_none() {
             let path = self.args.serve_path.join(INDEX_NAME);
             if !self.entry_ip_allowed(&path, ip).await {
+                status_forbid(res);
+                return Ok(());
+            }
+            if !self.file_acl_allows(&path, acl_user).await {
                 status_forbid(res);
                 return Ok(());
             }
@@ -2032,27 +2057,14 @@ impl Server {
             }
         };
 
-        let authorization = headers.get(AUTHORIZATION);
-        let guard = self
-            .args
-            .auth
-            .guard(
-                &dest_path,
-                req.method(),
-                authorization,
-                None,
-                false,
-                &self.args.serve_path,
-            )
-            .await;
-
-        match guard {
-            (_, Some(_), _) => {}
-            _ => {
-                status_forbid(res);
-                return None;
-            }
-        };
+        // The destination must be authorized exactly like the source: through
+        // the OIDC session when that adapter is active, and with the per-path
+        // ACL applied on top of the --auth tree. Using the builtin guard here
+        // made every MOVE/COPY fail under --auth-type oidc.
+        if !self.dest_writable(req, &dest_path).await {
+            status_forbid(res);
+            return None;
+        }
 
         if !self.ip_allowed(&dest_path, ip).await {
             status_forbid(res);
@@ -2149,6 +2161,20 @@ impl Server {
         hex::encode(hasher.finalize())
     }
 
+    /// Whether the per-path acl allows reading `path`. Used where a file is
+    /// served on behalf of another path (render-index / render-spa), where the
+    /// main guard only checked the requested directory.
+    async fn file_acl_allows(&self, path: &Path, acl_user: &str) -> bool {
+        let rel_path = path
+            .strip_prefix(&self.args.serve_path)
+            .map(normalize_path)
+            .unwrap_or_default();
+        !matches!(
+            self.acl_perm(&rel_path, acl_user).await,
+            Some(AclPerm::Deny)
+        )
+    }
+
     /// The user acl decision for a path relative to the serve root.
     async fn acl_perm(&self, path: &str, user: &str) -> Option<AclPerm> {
         self.user_acl_snapshot()
@@ -2193,6 +2219,40 @@ impl Server {
             Some(AclPerm::Write) => true,
             Some(_) => false,
             None => parent_paths.as_ref().is_some_and(|v| v.perm().readwrite()),
+        }
+    }
+
+    /// Whether the identity behind the request may write `path`, used for the
+    /// destination of MOVE/COPY.
+    async fn dest_writable(&self, req: &Request, path: &str) -> bool {
+        let headers = req.headers();
+        let (user, access_paths, _) = if let Some(oidc) = &self.oidc {
+            self.guard_oidc(oidc, headers, path, req.method()).await
+        } else {
+            self.args
+                .auth
+                .guard(
+                    path,
+                    req.method(),
+                    headers.get(AUTHORIZATION),
+                    None,
+                    false,
+                    &self.args.serve_path,
+                )
+                .await
+        };
+        // x users may write anywhere they can reach.
+        if access_paths.as_ref().is_some_and(|ap| ap.acl()) {
+            return true;
+        }
+        match self
+            .acl_perm(path, user.as_deref().unwrap_or("guest"))
+            .await
+        {
+            Some(AclPerm::Deny) => false,
+            Some(AclPerm::Read) => is_readonly_method(req.method()),
+            Some(AclPerm::Write) => true,
+            None => access_paths.is_some(),
         }
     }
 
