@@ -1,10 +1,12 @@
 #![allow(clippy::too_many_arguments)]
 
+use crate::args::AuthType;
 use crate::auth::{www_authenticate, AccessPaths, AccessPerm};
 use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
 use crate::ip_whitelist::{IpNet, IpWhitelist};
 use crate::ip_whitelist_store;
 use crate::noscript::{detect_noscript, generate_noscript_html};
+use crate::oidc::{Oidc, OidcConfig, SESSION_COOKIE};
 use crate::utils::{
     decode_uri, encode_uri, get_file_name, glob, join_within, parse_range, try_get_file_name,
 };
@@ -64,6 +66,7 @@ const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
 const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
 const IP_WHITELIST_API_PATH: &str = "__dufs__/ip-whitelist";
+const OIDC_PREFIX: &str = "__dufs__/oidc/";
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
 
 pub struct Server {
@@ -72,6 +75,7 @@ pub struct Server {
     html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
     ip_whitelist: RwLock<Arc<IpWhitelist>>,
+    oidc: Option<Oidc>,
     running: Arc<AtomicBool>,
 }
 
@@ -130,6 +134,18 @@ impl Server {
             Arc::new(args.ip_whitelist.clone())
         };
 
+        let oidc = match args.auth_type {
+            AuthType::Oidc => {
+                if !args.auth.has_users() {
+                    return Err(anyhow!(
+                        "--auth-type oidc requires at least one --auth rule, e.g. --auth 'user:pass@/:rw'"
+                    ));
+                }
+                Some(Oidc::new(OidcConfig::from_env()?)?)
+            }
+            AuthType::Builtin => None,
+        };
+
         Ok(Self {
             args,
             running,
@@ -137,6 +153,7 @@ impl Server {
             assets_prefix,
             html,
             ip_whitelist: RwLock::new(ip_whitelist),
+            oidc,
         })
     }
 
@@ -248,21 +265,42 @@ impl Server {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
 
-        let (user, access_paths, via_token) = self
-            .args
-            .auth
-            .guard(
-                &relative_path,
-                &method,
-                authorization,
-                query_params.get("token"),
-                is_microsoft_webdav,
-                &self.args.serve_path,
-            )
-            .await;
+        if let Some(oidc) = &self.oidc {
+            if let Some(action) = relative_path.strip_prefix(OIDC_PREFIX) {
+                if !ip_ok {
+                    status_forbid(&mut res);
+                    return Ok(res);
+                }
+                return self.handle_oidc(oidc, action, &req).await;
+            }
+        }
+
+        let (user, access_paths, via_token) = if let Some(oidc) = &self.oidc {
+            self.guard_oidc(oidc, headers, &relative_path, &method)
+                .await
+        } else {
+            self.args
+                .auth
+                .guard(
+                    &relative_path,
+                    &method,
+                    authorization,
+                    query_params.get("token"),
+                    is_microsoft_webdav,
+                    &self.args.serve_path,
+                )
+                .await
+        };
 
         let (user, access_paths) = match (user, access_paths) {
             (None, None) => {
+                if self.oidc.is_some() {
+                    let next = urlencoding::encode(req_path.as_str());
+                    let location =
+                        format!("{}__dufs__/oidc/login?next={next}", self.args.uri_prefix);
+                    redirect(&mut res, &location);
+                    return Ok(res);
+                }
                 self.auth_reject(&mut res)?;
                 return Ok(res);
             }
@@ -298,7 +336,16 @@ impl Server {
             }
             return Ok(res);
         } else if method.as_str() == "LOGOUT" {
-            self.auth_reject(&mut res)?;
+            if let Some(oidc) = &self.oidc {
+                if let Some(session_id) = Oidc::session_id(headers) {
+                    oidc.remove_session(&session_id);
+                }
+                res.headers_mut()
+                    .insert("set-cookie", self.clear_session_cookie());
+                *res.status_mut() = StatusCode::NO_CONTENT;
+            } else {
+                self.auth_reject(&mut res)?;
+            }
             return Ok(res);
         }
 
@@ -307,7 +354,7 @@ impl Server {
         if has_query_flag(&query_params, "tokengen") {
             // A share token must not be able to mint another token, otherwise a
             // short-lived link could be renewed forever regardless of expiry.
-            if via_token {
+            if via_token || self.oidc.is_some() {
                 self.auth_reject(&mut res)?;
                 return Ok(res);
             }
@@ -1255,6 +1302,7 @@ impl Server {
             allow_upload: self.args.allow_upload,
             allow_delete: self.args.allow_delete,
             auth: self.args.auth.has_users(),
+            auth_type: self.args.auth_type.as_str().to_string(),
             user,
             editable,
         };
@@ -1570,6 +1618,7 @@ impl Server {
             allow_ip_whitelist: self.args.allow_ip_whitelist && readwrite,
             dir_exists: exist,
             auth: self.args.auth.has_users(),
+            auth_type: self.args.auth_type.as_str().to_string(),
             user,
             paths,
         };
@@ -1610,6 +1659,136 @@ impl Server {
         www_authenticate(res, &self.args)?;
         *res.status_mut() = StatusCode::UNAUTHORIZED;
         Ok(())
+    }
+
+    /// Resolve the authenticated identity for OIDC mode.
+    async fn guard_oidc(
+        &self,
+        oidc: &Oidc,
+        headers: &HeaderMap<HeaderValue>,
+        path: &str,
+        method: &Method,
+    ) -> (Option<String>, Option<AccessPaths>, bool) {
+        if let Some(session_id) = Oidc::session_id(headers) {
+            if let Some(username) = oidc.session_user(&session_id) {
+                if let Some(access_paths) = self.args.auth.paths_for_user(&username) {
+                    let guarded = access_paths
+                        .guard(path, method, Some(&self.args.serve_path))
+                        .await;
+                    return (Some(username), guarded, false);
+                }
+                return (Some(username), None, false);
+            }
+        }
+        if let Some(access_paths) = self.args.auth.anonymous_paths() {
+            let guarded = access_paths
+                .guard(path, method, Some(&self.args.serve_path))
+                .await;
+            return (None, guarded, false);
+        }
+        (None, None, false)
+    }
+
+    /// Handle the OIDC login, callback and logout endpoints.
+    async fn handle_oidc(&self, oidc: &Oidc, action: &str, req: &Request) -> Result<Response> {
+        let mut res = Response::default();
+        if req.method() != Method::GET && req.method() != Method::HEAD {
+            *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+            return Ok(res);
+        }
+        let query_params: HashMap<String, String> =
+            form_urlencoded::parse(req.uri().query().unwrap_or_default().as_bytes())
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        match action {
+            "login" => {
+                let next = query_params.get("next").map(String::as_str).unwrap_or("/");
+                match oidc.begin_login(next).await {
+                    Ok(url) => redirect(&mut res, &url),
+                    Err(err) => {
+                        error!("OIDC login request failed, {err}");
+                        *res.status_mut() = StatusCode::BAD_GATEWAY;
+                        *res.body_mut() = body_full("OIDC login is unavailable");
+                    }
+                }
+            }
+            "callback" => {
+                let (code, state) = match (
+                    query_params.get("code").cloned(),
+                    query_params.get("state").cloned(),
+                ) {
+                    (Some(code), Some(state)) => (code, state),
+                    _ => {
+                        status_bad_request(&mut res, "Missing OIDC code or state");
+                        return Ok(res);
+                    }
+                };
+                match oidc.complete_login(code, state).await {
+                    Ok((username, next)) => {
+                        let session = oidc.create_session(username);
+                        res.headers_mut()
+                            .insert("set-cookie", self.session_cookie(&session));
+                        redirect(&mut res, &next);
+                    }
+                    Err(err) => {
+                        error!("OIDC callback failed, {err}");
+                        *res.status_mut() = StatusCode::UNAUTHORIZED;
+                        *res.body_mut() = body_full("OIDC authentication failed");
+                    }
+                }
+            }
+            "logout" => {
+                if let Some(session_id) = Oidc::session_id(req.headers()) {
+                    oidc.remove_session(&session_id);
+                }
+                res.headers_mut()
+                    .insert("set-cookie", self.clear_session_cookie());
+                redirect(&mut res, &self.args.uri_prefix);
+            }
+            _ => status_not_found(&mut res),
+        }
+        Ok(res)
+    }
+
+    /// Cookie scope; the prefix itself is included so a request to the
+    /// prefix without a trailing slash still sends the cookie.
+    fn cookie_path(&self) -> &str {
+        let path = self.args.uri_prefix.trim_end_matches('/');
+        if path.is_empty() {
+            "/"
+        } else {
+            path
+        }
+    }
+
+    fn session_cookie(&self, session: &str) -> HeaderValue {
+        let mut value = format!(
+            "{SESSION_COOKIE}={session}; Path={}; HttpOnly; SameSite=Lax; Max-Age={}",
+            self.cookie_path(),
+            self.oidc_session_ttl_secs()
+        );
+        if self.args.tls_cert.is_some() {
+            value.push_str("; Secure");
+        }
+        HeaderValue::from_str(&value).unwrap_or_else(|_| HeaderValue::from_static(""))
+    }
+
+    fn clear_session_cookie(&self) -> HeaderValue {
+        let mut value = format!(
+            "{SESSION_COOKIE}=; Path={}; HttpOnly; SameSite=Lax; Max-Age=0",
+            self.cookie_path()
+        );
+        if self.args.tls_cert.is_some() {
+            value.push_str("; Secure");
+        }
+        HeaderValue::from_str(&value).unwrap_or_else(|_| HeaderValue::from_static(""))
+    }
+
+    fn oidc_session_ttl_secs(&self) -> u64 {
+        self.oidc
+            .as_ref()
+            .map(|oidc| oidc.session_ttl().as_secs())
+            .unwrap_or(0)
     }
 
     async fn guard_root_contained(&self, path: &Path) -> bool {
@@ -1817,19 +1996,21 @@ impl Server {
             return Ok(res);
         }
 
-        let authorization = req.headers().get(AUTHORIZATION);
-        let (_, access_paths, _) = self
-            .args
-            .auth
-            .guard(
-                "/",
-                &method,
-                authorization,
-                None,
-                false,
-                &self.args.serve_path,
-            )
-            .await;
+        let (_, access_paths, _) = if let Some(oidc) = &self.oidc {
+            self.guard_oidc(oidc, req.headers(), "/", &method).await
+        } else {
+            self.args
+                .auth
+                .guard(
+                    "/",
+                    &method,
+                    req.headers().get(AUTHORIZATION),
+                    None,
+                    false,
+                    &self.args.serve_path,
+                )
+                .await
+        };
         let access_paths = match access_paths {
             Some(v) => v,
             None => {
@@ -2050,6 +2231,7 @@ pub struct IndexData {
     pub allow_ip_whitelist: bool,
     pub dir_exists: bool,
     pub auth: bool,
+    pub auth_type: String,
     pub user: Option<String>,
     pub paths: Vec<PathItem>,
 }
@@ -2180,6 +2362,7 @@ struct EditData {
     allow_upload: bool,
     allow_delete: bool,
     auth: bool,
+    auth_type: String,
     user: Option<String>,
     editable: bool,
 }
@@ -2301,6 +2484,13 @@ fn status_forbid(res: &mut Response) {
 fn status_not_found(res: &mut Response) {
     *res.status_mut() = StatusCode::NOT_FOUND;
     *res.body_mut() = body_full("Not Found");
+}
+
+fn redirect(res: &mut Response, location: &str) {
+    *res.status_mut() = StatusCode::FOUND;
+    if let Ok(value) = HeaderValue::from_str(location) {
+        res.headers_mut().insert("location", value);
+    }
 }
 
 fn status_no_content(res: &mut Response) {

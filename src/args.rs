@@ -91,6 +91,15 @@ pub fn build_cli() -> Command {
                 .value_name("rules"),
         )
         .arg(
+            Arg::new("auth-type")
+                .env("DUFS_AUTH_TYPE")
+                .hide_env(true)
+                .long("auth-type")
+                .help("Select the authentication adapter [default: builtin]")
+                .value_parser(clap::builder::EnumValueParser::<AuthType>::new())
+                .value_name("type"),
+        )
+        .arg(
             Arg::new("auth-method")
                 .hide(true)
                 .env("DUFS_AUTH_METHOD")
@@ -312,6 +321,8 @@ pub struct Args {
     pub hidden: Vec<String>,
     #[serde(deserialize_with = "deserialize_access_control")]
     pub auth: AccessControl,
+    #[serde(default)]
+    pub auth_type: AuthType,
     #[serde(deserialize_with = "deserialize_ip_whitelist")]
     pub ip_whitelist: IpWhitelist,
     #[serde(deserialize_with = "deserialize_trusted_proxies")]
@@ -399,6 +410,10 @@ impl Args {
         if let Some(rules) = matches.get_many::<String>("auth") {
             let rules: Vec<_> = rules.map(|v| v.as_str()).collect();
             args.auth = AccessControl::new(&rules)?;
+        }
+
+        if let Some(auth_type) = matches.get_one::<AuthType>("auth-type") {
+            args.auth_type = *auth_type;
         }
 
         if let Some(rules) = matches.get_many::<String>("ip-whitelist") {
@@ -523,6 +538,36 @@ impl Args {
             bail!("Path `{}` doesn't contains index.html", path.display());
         }
         Ok(path)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthType {
+    #[default]
+    Builtin,
+    Oidc,
+}
+
+impl AuthType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuthType::Builtin => "builtin",
+            AuthType::Oidc => "oidc",
+        }
+    }
+}
+
+impl ValueEnum for AuthType {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::Builtin, Self::Oidc]
+    }
+
+    fn to_possible_value(&self) -> Option<PossibleValue> {
+        Some(match self {
+            AuthType::Builtin => PossibleValue::new("builtin"),
+            AuthType::Oidc => PossibleValue::new("oidc"),
+        })
     }
 }
 
@@ -903,5 +948,34 @@ hidden:
             .try_get_matches_from(vec!["", "--trusted-proxy", "not-an-ip"])
             .unwrap();
         assert!(Args::parse(matches).is_err());
+    }
+
+    #[test]
+    fn test_args_auth_type() {
+        let cli = build_cli();
+        let matches = cli
+            .try_get_matches_from(vec!["", "--auth-type", "oidc"])
+            .unwrap();
+        assert_eq!(Args::parse(matches).unwrap().auth_type, AuthType::Oidc);
+
+        let cli = build_cli();
+        let matches = cli.try_get_matches_from(vec![""]).unwrap();
+        assert_eq!(Args::parse(matches).unwrap().auth_type, AuthType::Builtin);
+
+        let cli = build_cli();
+        assert!(cli
+            .try_get_matches_from(vec!["", "--auth-type", "nope"])
+            .is_err());
+    }
+
+    #[test]
+    fn test_args_auth_type_config() {
+        let tmpdir = assert_fs::TempDir::new().unwrap();
+        let config_file = tmpdir.child("config.yaml");
+        config_file.write_str("auth-type: oidc\n").unwrap();
+        let matches = build_cli()
+            .try_get_matches_from(vec!["", "-c", &config_file.to_string_lossy()])
+            .unwrap();
+        assert_eq!(Args::parse(matches).unwrap().auth_type, AuthType::Oidc);
     }
 }

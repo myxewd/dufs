@@ -61,6 +61,7 @@ Options:
       --path-prefix <path>   Specify a path prefix
       --hidden <value>       Hide paths from directory listings, e.g. tmp,*.log,*.lock
   -a, --auth <rules>         Add auth roles, e.g. user:pass@/dir1:rw,/dir2
+      --auth-type <type>     Select the authentication adapter [default: builtin] [possible values: builtin, oidc]
       --ip-whitelist <rules> Set ip whitelist for paths, e.g. 127.0.0.1,10.0.0.0/8@/dir1
       --trusted-proxy <addrs> Trust forwarded headers from these proxy addresses, e.g. 127.0.0.1,10.0.0.0/8
   -A, --allow-all            Allow all operations
@@ -274,6 +275,36 @@ Two important things for hashed passwords:
 2. Digest authentication does not function properly with hashed passwords.
 
 
+### OIDC Authentication
+
+Dufs can delegate authentication to an OpenID Connect provider. Select the adapter with `--auth-type oidc` (or `DUFS_AUTH_TYPE=oidc`); `builtin` keeps the default username/password behaviour. The OIDC client is configured through environment variables:
+
+| variable | required | description |
+| --- | --- | --- |
+| `DUFS_OIDC_ISSUER` | yes | Issuer URL, used for OpenID Connect discovery |
+| `DUFS_OIDC_CLIENT_ID` | yes | Client id registered with the provider |
+| `DUFS_OIDC_CLIENT_SECRET` | no | Client secret; omit for a public client using PKCE |
+| `DUFS_OIDC_REDIRECT_URI` | yes | Public callback URL, e.g. `https://files.example.com/__dufs__/oidc/callback` (include any path prefix) |
+| `DUFS_OIDC_SCOPES` | no | Space separated scopes [default: `openid profile email`] |
+| `DUFS_OIDC_USERNAME_CLAIM` | no | Claim used as the username [default: `preferred_username`] |
+| `DUFS_OIDC_SESSION_HOURS` | no | Session lifetime in hours [default: 168] |
+
+`DUFS_AUTH` still defines the permissions, keyed by the username returned by the provider. The password part of each rule is not used, so it can be any placeholder:
+
+```sh
+export DUFS_AUTH_TYPE=oidc
+export DUFS_AUTH='alice:unused@/:rw|bob:unused@/public'
+export DUFS_OIDC_ISSUER=https://sso.example.com
+export DUFS_OIDC_CLIENT_ID=dufs
+export DUFS_OIDC_CLIENT_SECRET=change-me
+export DUFS_OIDC_REDIRECT_URI=https://files.example.com/__dufs__/oidc/callback
+dufs
+```
+
+The identity is the `preferred_username` claim by default — not `name` or `nickname`. Set `DUFS_OIDC_USERNAME_CLAIM` if your provider exposes the login name under another claim (for example `username` or `email`). A user who authenticates successfully but is absent from `DUFS_AUTH` gets no access. Anonymous access (`@/`) still applies if configured.
+
+Requests without a session are redirected to the provider; after the callback a session cookie is set and the original path is restored. Sessions live in memory, so restarting dufs signs everyone out. The callback endpoint is `__dufs__/oidc/callback` under the configured path prefix.
+
 ### IP Whitelist
 
 Dufs can restrict a file or a directory to a list of client addresses with `--ip-whitelist`.
@@ -412,6 +443,7 @@ All options can be set using environment variables prefixed with `DUFS_`.
     --path-prefix <path>    DUFS_PATH_PREFIX=/dufs
     --hidden <value>        DUFS_HIDDEN=tmp,*.log,*.lock
 -a, --auth <rules>          DUFS_AUTH="admin:admin@/:rw|@/" 
+    --auth-type <type>      DUFS_AUTH_TYPE=oidc
     --ip-whitelist <rules>  DUFS_IP_WHITELIST="127.0.0.1@/dir1"
     --trusted-proxy <addrs> DUFS_TRUSTED_PROXY="127.0.0.1,10.0.0.0/8"
 -A, --allow-all             DUFS_ALLOW_ALL=true
@@ -453,6 +485,7 @@ auth:
   - admin:admin@/:rw
   - user:pass@/src:rw,/share
   - '@/'  # According to the YAML spec, quoting is required.
+auth-type: builtin
 ip-whitelist:
   - '127.0.0.1,192.168.0.0/16@/'
   - '@/.git'  # According to the YAML spec, quoting is required.

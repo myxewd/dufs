@@ -6,6 +6,7 @@ mod ip_whitelist;
 mod ip_whitelist_store;
 mod logger;
 mod noscript;
+mod oidc;
 mod server;
 mod trusted_proxy;
 mod utils;
@@ -41,6 +42,13 @@ use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(feature = "tls")]
+    {
+        // Both rustls crypto providers are compiled in (aws-lc-rs for the
+        // server and ring pulled in by the OIDC http client), so install a
+        // process-wide default before any TLS configuration is built.
+        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
     let cmd = build_cli();
     let matches = cmd.get_matches();
     if let Some(generator) = matches.get_one::<Shell>("completions") {

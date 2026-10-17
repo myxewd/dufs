@@ -17,6 +17,7 @@
  * @property {boolean} allow_search
  * @property {boolean} allow_archive
  * @property {boolean} auth
+ * @property {"builtin" | "oidc"} auth_type
  * @property {string} user
  * @property {boolean} dir_exists
  * @property {string} editable
@@ -449,7 +450,7 @@ async function setupIndexPage() {
   renderPathsTableHead();
   renderPathsTableBody();
 
-  if (DATA.user) {
+  if (DATA.user && DATA.auth_type !== "oidc") {
     setupDownloadWithToken();
   }
 }
@@ -620,6 +621,11 @@ async function setupAuth() {
   } else {
     $loginBtn.classList.remove("hidden");
     $loginBtn.addEventListener("click", async () => {
+      if (DATA.auth_type === "oidc") {
+        const next = encodeURIComponent(location.pathname + location.search);
+        location.href = `${DATA.uri_prefix}__dufs__/oidc/login?next=${next}`;
+        return;
+      }
       try {
         await checkAuth("login");
       } catch { }
@@ -1004,6 +1010,10 @@ async function checkAuth(variant) {
 
 function logout() {
   if (!DATA.auth) return;
+  if (DATA.auth_type === "oidc") {
+    location.href = `${DATA.uri_prefix}__dufs__/oidc/logout`;
+    return;
+  }
   const url = baseUrl();
   const xhr = new XMLHttpRequest();
   xhr.open("LOGOUT", url, true, DATA.user);

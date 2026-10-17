@@ -113,6 +113,16 @@ impl AccessControl {
         !self.users.is_empty()
     }
 
+    /// The access paths configured for an authenticated username.
+    pub fn paths_for_user(&self, user: &str) -> Option<&AccessPaths> {
+        self.users.get(user).map(|(_, access_paths)| access_paths)
+    }
+
+    /// The access paths granted to anonymous requests, if any.
+    pub fn anonymous_paths(&self) -> Option<&AccessPaths> {
+        self.anonymous.as_ref()
+    }
+
     /// Returns the guarded `(user, access_paths, via_token)`. `via_token` is
     /// true only when the identity was established by a share token rather than
     /// primary credentials or anonymous access. `root` is the served directory,

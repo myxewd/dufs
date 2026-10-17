@@ -9,6 +9,7 @@ All notable changes to this project will be documented in this file.
 - Add a per-file/per-directory IP whitelist (`--ip-whitelist`), editable from the WebUI with `--allow-ip-whitelist`
 - Store the IP whitelist in a `.dufs` metadata directory at the served root, which is never served
 - Add `--trusted-proxy` so the IP whitelist works behind a reverse proxy via `X-Forwarded-For`/`X-Real-IP`
+- Add an OIDC authentication adapter (`--auth-type oidc`), using the provider username with the existing `--auth` roles
 
 ## [0.46.0] - 2026-05-07
 
