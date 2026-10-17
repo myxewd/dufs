@@ -71,13 +71,13 @@ fn api_put_applies_and_persists(
     // persisted under .dufs
     assert!(server.path().join(".dufs/ip-whitelist.json").is_file());
 
-    // enforced immediately, without a restart
-    // a manager may browse the denied directory ...
+    // enforced immediately, without a restart; the ip whitelist is the
+    // highest layer, so even a manager cannot browse the denied directory
     assert_eq!(
         reqwest::blocking::get(format!("{}dir1/", server.url()))?.status(),
-        200
+        403
     );
-    // ... but not read its files
+    // ... and its files stay inaccessible
     assert_eq!(
         reqwest::blocking::get(format!("{}dir1/test.txt", server.url()))?.status(),
         403
@@ -208,21 +208,20 @@ fn find_path(server: &TestServer, name: &str) -> serde_json::Value {
 }
 
 #[rstest]
-fn manager_sees_denied_entries(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
+fn manager_is_ip_limited(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
     put_rules(&server, serde_json::json!({ "/dir1": [] }))?;
 
-    // the manager still sees the denied entry, marked blocked
-    let dir1 = find_path(&server, "dir1");
-    assert_eq!(dir1["whitelist"], "blocked");
-
-    // the manager may open the denied directory to configure its children ...
+    // the ip whitelist is the highest layer: a blocked path is hidden even
+    // from an acl manager
+    let resp = reqwest::blocking::get(format!("{}?json", server.url()))?;
+    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert!(!data["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v["name"] == "dir1"));
     assert_eq!(
         reqwest::blocking::get(format!("{}dir1/", server.url()))?.status(),
-        200
-    );
-    // ... but not read its files
-    assert_eq!(
-        reqwest::blocking::get(format!("{}dir1/test.txt", server.url()))?.status(),
         403
     );
     Ok(())

@@ -71,7 +71,7 @@ Options:
       --allow-symlink        Allow symlink to files/folders outside root directory
       --allow-archive        Allow download folders as archive file
       --allow-hash           Allow ?hash query to get file sha256 hash
-      --allow-ip-whitelist   Allow managing the per-path ip whitelist from the WebUI
+      --allow-ip-whitelist   Allow managing the per-path acl from the WebUI; requires the x permission
       --enable-cors          Enable CORS, sets `Access-Control-Allow-Origin: *`
       --render-index         Serve index.html when requesting a directory, returns 404 if not found index.html
       --render-try-index     Serve index.html when requesting a directory, returns directory listing if not found index.html
@@ -243,8 +243,10 @@ dufs -a user:pass@/:rw,/dir1 -a @/
 2. Use `:` to separate the username and password of the account.
 3. Use `,` to separate paths.
 4. Use path suffix `:rw`/`:ro` set permissions: `read-write`/`read-only`. `:ro` can be omitted.
+5. Add `x` to the suffix (`:rwx`, `:rx`, `:x`) to let the user edit the acl of that path.
 
 - `-a admin:admin@/:rw`: `admin` has complete permissions for all paths.
+- `-a admin:admin@/:rwx`: `admin` can also edit the acl for every path.
 - `-a guest:guest@/`: `guest` has read-only permissions for all paths.
 - `-a user:pass@/:rw,/dir1`: `user` has read-write permissions for `/*`, has read-only permissions for `/dir1/*`.
 - `-a @/`: All paths is publicly accessible, everyone can view/download it.
@@ -287,6 +289,7 @@ Dufs can delegate authentication to an OpenID Connect provider. Select the adapt
 | `DUFS_OIDC_CLIENT_ID` | yes | Client id registered with the provider |
 | `DUFS_OIDC_CLIENT_SECRET` | no | Client secret; omit for a public client using PKCE |
 | `DUFS_OIDC_REDIRECT_URI` | yes | Public callback URL, e.g. `https://files.example.com/__dufs__/oidc/callback` (include any path prefix) |
+| `DUFS_OIDC_POST_LOGOUT_REDIRECT_URI` | no | Post-logout URL; defaults to `DUFS_OIDC_REDIRECT_URI` minus `__dufs__/oidc/callback` |
 | `DUFS_OIDC_SCOPES` | no | Space separated scopes [default: `openid profile email`] |
 | `DUFS_OIDC_USERNAME_CLAIM` | no | Claim used as the username [default: `preferred_username`] |
 | `DUFS_OIDC_SESSION_HOURS` | no | Session lifetime in hours [default: 168] |
@@ -305,9 +308,9 @@ dufs
 
 The identity is the `preferred_username` claim by default — not `name` or `nickname`. Set `DUFS_OIDC_USERNAME_CLAIM` if your provider exposes the login name under another claim (for example `username` or `email`). A user who authenticates successfully but is absent from `DUFS_AUTH` gets no access. Anonymous access (`@/`) still applies if configured.
 
-Without a session the visitor is the `guest` identity. If `guest` (or an anonymous `@/` rule) is configured the page loads and the top-right **Login** button redirects to the provider; otherwise requests are redirected automatically. After the callback a session cookie is set and the original path is restored. Sessions live in memory, so restarting dufs signs everyone out. The callback endpoint is `__dufs__/oidc/callback` under the configured path prefix.
+Without a session the visitor is the `guest` identity. If `guest` (or an anonymous `@/` rule) is configured the page loads and the top-right **Login** button redirects to the provider; otherwise requests are redirected automatically. Configure a guest if you want the page to be visible without starting authentication. After the callback a session cookie is set and the original path is restored. Sessions live in memory, so restarting dufs signs everyone out. The callback endpoint is `__dufs__/oidc/callback` under the configured path prefix. Logging out clears the local session and redirects to the provider's `end_session_endpoint` with the `id_token_hint`, so the provider SSO session ends too; register the dufs root as a **Valid post logout redirect URI** in the provider. The post-logout URL defaults to `DUFS_OIDC_REDIRECT_URI` minus `__dufs__/oidc/callback` and can be overridden with `DUFS_OIDC_POST_LOGOUT_REDIRECT_URI`.
 
-### IP Whitelist
+### Path ACL
 
 Dufs can restrict a file or a directory to a list of client addresses with `--ip-whitelist`.
 
@@ -342,13 +345,31 @@ ip-whitelist:
     - 192.168.0.0/16
 ```
 
+#### User read/write rules
+
+Besides client addresses, a path can carry per-user read/write rules. They are edited from the same shield dialog and stored next to the ip whitelist.
+
+- **Allow read**: the entry appears in the user's listings and can be read. The ip whitelist still applies.
+- **Allow write**: the user can write the file/directory (for a directory: upload into it). Write implies read, and new files inherit the directory's rule.
+- **Deny read**: the user cannot read or write the path, even when an ancestor allows it.
+
+The acl is evaluated per user: the nearest ancestor rule that mentions the user wins, so a child rule only needs to list the users it changes. A path inside a managed subtree that never mentions the user defaults to deny; a path with no rule at all falls back to `--auth`. When the lists conflict, deny beats write and write beats read. A user listed in `allow_read`/`allow_write` gets access even when `--auth` does not grant it, and `deny_read` wins over an `--auth` grant. The `guest` identity may be listed as a normal username to control unauthenticated visitors.
+
+Editing the acl requires the `x` permission for the target path (and `--allow-ip-whitelist`):
+
+```sh
+dufs -a admin:pass@/:rwx -a alice:pass@/:ro --allow-ip-whitelist
+```
+
+`x` users always win over the acl (they cannot be denied), but they are still limited by the ip whitelist. The backend rejects a save where the same user is both allowed and denied, where an `x` user is denied, or where the version is stale; `allow_write` users are added to `allow_read` automatically.
+
 #### Managing from the WebUI
 
-Start dufs with `--allow-ip-whitelist` (or `-A`) and a shield button appears in the WebUI toolbar and on every row. It opens a one-field editor for that file or directory. Only users with read-write access to the root may use it.
+Start dufs with `--allow-ip-whitelist` (or `-A`) and grant a user the `x` permission; a shield button appears in the WebUI toolbar and on every row. It opens an editor with three tabs (`Read` / `Write` / `Deny Read`) plus the ip list; each tab is a tag editor: own entries are removable tags, inherited entries are dark locked tags without a remove button and are always shown first, and typing a username and pressing Tab adds a tag. Only entries configured on the target path are stored: entries inherited from the nearest ancestor are computed live and are never written into the file. Adding the same user to another list (for example deny) overrides the inherited entry for that user only. Saving shows a diff of the effective before/after permission of the changed users. Only a user with `x` for the target path may save it.
 
-The list gets a `Whitelist` column: an empty list renders as `blocked` (nobody may access the path), a list containing `0.0.0.0/0` (or `::/0`) renders as blank (everyone may access it), and any other list shows its members. The editor pre-fills the whitelist that currently applies, so a path with no rule of its own shows `0.0.0.0/0` (everyone) and an empty input always means `blocked`. `Remove rule` drops the path's own rule so it inherits its closest configured parent again. A manager can still see and configure a path its own address is not allowed to access, but reading that content returns 403.
+The list gets a `Whitelist` column: an empty list renders as `blocked` (nobody may access the path), a list containing `0.0.0.0/0` (or `::/0`) renders as blank (everyone may access it), and any other list shows its members. The editor pre-fills the whitelist that currently applies, so a path with no rule of its own shows `0.0.0.0/0` (everyone) and an empty input always means `blocked`. `Remove rule` drops the path's own rule so it inherits its closest configured parent again. Saving shows a diff of the affected users (before/after, the change types, and the acl rule chain) and asks for confirmation; a stale acl version is rejected with a conflict. The list also shows `Read` / `Write` columns: `alice` is a full grant, `(peter)` means a descendant denies the user, `[tom]` is an allow that only exists on a descendant, and `alice*` marks an `x` user; `guest` is shown as-is and full-write users (including `x` users) are omitted from the read column. The `Read` / `Write` columns are only shown to users with `x`, and a column without any entries is dropped. Long cells are truncated with `...` and open a full-list dialog; the dialog has a filter box, pressing Enter filters by the keyword (shown in the title), and pressing Enter on an empty box clears the filter. The summary is computed on demand from the in-memory rules (no separate index file); clicking a username does not open a per-user diff editor yet. The top-right Login button forces a fresh challenge even when the browser still holds guest credentials; after a successful login the `?login` marker is dropped and the page reloads without it. Only this button challenges: ordinary page and asset requests (including the plain `/favicon.ico`) never trigger a browser auth prompt. The management API accepts both Basic and Digest auth for reads and writes. The ip whitelist is the highest layer: a path the client address may not access is hidden even from an `x` user, while the management API itself stays available for fixing other paths. An `x` user still sees acl-denied entries in listings, search results and archives so they can manage them; for other callers, search results and archives only contain entries they may read, and the metadata dir is always excluded.
 
-Rules are stored in `<serve-path>/.dufs/ip-whitelist.json`. The `.dufs` directory holds dufs metadata: it is never listed, downloaded, searched, archived or served, and it cannot be written to over HTTP.
+Rules are stored in `<serve-path>/.dufs/ip-whitelist.json` and `<serve-path>/.dufs/user-acl.json`. The `.dufs` directory holds dufs metadata: it is never listed, downloaded, searched, archived or served, and it cannot be written to over HTTP.
 
 ```sh
 dufs --allow-ip-whitelist

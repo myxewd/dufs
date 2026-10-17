@@ -184,6 +184,15 @@ fn auth_check3(
 }
 
 #[rstest]
+fn favicon_is_served_without_auth(
+    #[with(&["--auth", "admin:admin@/:rw", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    let resp = fetch!(b"GET", format!("{}favicon.ico", server.url())).send()?;
+    assert_eq!(resp.status(), 200);
+    Ok(())
+}
+
+#[rstest]
 fn auth_logout(
     #[with(&["--auth", "user:pass@/:rw", "-A"])] server: TestServer,
 ) -> Result<(), Error> {

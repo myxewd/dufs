@@ -43,7 +43,7 @@ impl Default for AccessControl {
             empty: true,
             use_hashed_password: false,
             users: IndexMap::new(),
-            anonymous: Some(AccessPaths::new(AccessPerm::ReadWrite)),
+            anonymous: Some(AccessPaths::new_with_acl(AccessPerm::ReadWrite, true)),
         }
     }
 }
@@ -128,6 +128,33 @@ impl AccessControl {
             .or(self.anonymous.as_ref())
     }
 
+    /// The users holding the `x` permission for `path`, including `guest`
+    /// when the guest/anonymous rule carries it.
+    pub async fn x_users(&self, path: &str, root: &Path) -> Vec<String> {
+        let mut output = vec![];
+        for (user, (_, access_paths)) in &self.users {
+            if access_paths
+                .find(path, Some(root))
+                .await
+                .is_some_and(|v| v.acl())
+            {
+                output.push(user.clone());
+            }
+        }
+        if !output.iter().any(|v| v == "guest") {
+            if let Some(access_paths) = self.guest_paths() {
+                if access_paths
+                    .find(path, Some(root))
+                    .await
+                    .is_some_and(|v| v.acl())
+                {
+                    output.push("guest".to_string());
+                }
+            }
+        }
+        output
+    }
+
     /// Returns the guarded `(user, access_paths, via_token)`. `via_token` is
     /// true only when the identity was established by a share token rather than
     /// primary credentials or anonymous access. `root` is the served directory,
@@ -141,8 +168,39 @@ impl AccessControl {
         guard_options: bool,
         root: &Path,
     ) -> (Option<String>, Option<AccessPaths>, bool) {
+        self.guard_with_auth_method(
+            path,
+            method,
+            method,
+            authorization,
+            token,
+            guard_options,
+            root,
+        )
+        .await
+    }
+
+    /// Like [`Self::guard`], but validates credentials against `auth_method`
+    /// while checking permissions with `method`. A digest hash is bound to the
+    /// real request method (PUT/DELETE), even when the management API checks
+    /// the `x` permission with GET.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn guard_with_auth_method(
+        &self,
+        path: &str,
+        method: &Method,
+        auth_method: &Method,
+        authorization: Option<&HeaderValue>,
+        token: Option<&String>,
+        guard_options: bool,
+        root: &Path,
+    ) -> (Option<String>, Option<AccessPaths>, bool) {
         if self.empty {
-            return (None, Some(AccessPaths::new(AccessPerm::ReadWrite)), false);
+            return (
+                None,
+                Some(AccessPaths::new_with_acl(AccessPerm::ReadWrite, true)),
+                false,
+            );
         }
 
         if method == Method::GET {
@@ -156,7 +214,7 @@ impl AccessControl {
         if let Some(authorization) = authorization {
             if let Some(user) = get_auth_user(authorization) {
                 if let Some((pass, ap)) = self.users.get(&user) {
-                    if check_auth(authorization, method.as_str(), &user, pass).is_some() {
+                    if check_auth(authorization, auth_method.as_str(), &user, pass).is_some() {
                         if method == Method::OPTIONS {
                             return (
                                 Some(user),
@@ -234,15 +292,26 @@ impl AccessControl {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AccessPaths {
     perm: AccessPerm,
+    /// The `x` permission: may modify the acl for this path.
+    acl: bool,
     children: IndexMap<String, AccessPaths>,
 }
 
 impl AccessPaths {
     pub fn new(perm: AccessPerm) -> Self {
+        Self::new_with_acl(perm, false)
+    }
+
+    pub fn new_with_acl(perm: AccessPerm, acl: bool) -> Self {
         Self {
             perm,
+            acl,
             ..Default::default()
         }
+    }
+
+    pub fn acl(&self) -> bool {
+        self.acl
     }
 
     pub fn perm(&self) -> AccessPerm {
@@ -256,14 +325,17 @@ impl AccessPaths {
     }
 
     pub fn merge(&mut self, paths: &str) -> Option<()> {
-        for item in paths.trim_matches(',').split(',') {
-            let (path, perm) = match item.split_once(':') {
-                None => (item, AccessPerm::ReadOnly),
-                Some((path, "ro")) => (path, AccessPerm::ReadOnly),
-                Some((path, "rw")) => (path, AccessPerm::ReadWrite),
-                _ => return None,
+        let paths = paths.trim_matches(',');
+        if paths.is_empty() {
+            // `user:pass@` grants nothing; it must not fall through to `/`.
+            return Some(());
+        }
+        for item in paths.split(',') {
+            let (path, (perm, acl)) = match item.split_once(':') {
+                None => (item, (AccessPerm::ReadOnly, false)),
+                Some((path, flags)) => (path, parse_perm_flags(flags)?),
             };
-            self.add(path, perm);
+            self.add(path, perm, acl);
         }
         Some(())
     }
@@ -276,23 +348,25 @@ impl AccessPaths {
         Some(target)
     }
 
-    fn add(&mut self, path: &str, perm: AccessPerm) {
+    fn add(&mut self, path: &str, perm: AccessPerm, acl: bool) {
         let path = path.trim_matches('/');
         if path.is_empty() {
             self.set_perm(perm);
+            self.acl = acl;
         } else {
             let parts: Vec<&str> = path.split('/').collect();
-            self.add_impl(&parts, perm);
+            self.add_impl(&parts, perm, acl);
         }
     }
 
-    fn add_impl(&mut self, parts: &[&str], perm: AccessPerm) {
+    fn add_impl(&mut self, parts: &[&str], perm: AccessPerm, acl: bool) {
         if parts.is_empty() {
             self.perm = perm;
+            self.acl = acl;
             return;
         }
         let child = self.children.entry(parts[0].to_string()).or_default();
-        child.add_impl(&parts[1..], perm)
+        child.add_impl(&parts[1..], perm, acl)
     }
 
     /// Merge anonymous `AccessPaths` into `self` (a user's paths) with "higher perm wins" semantics.
@@ -320,6 +394,9 @@ impl AccessPaths {
         if !combined.indexonly() && combined > self.perm {
             self.perm = combined;
         }
+        if anon.acl || orig_user.acl {
+            self.acl = true;
+        }
 
         let default_ap = AccessPaths::default();
         for (name, anon_child) in &anon.children {
@@ -345,11 +422,13 @@ impl AccessPaths {
             .filter(|v| !v.is_empty())
             .collect();
         let mut perm = self.perm;
+        let mut acl = self.acl;
         let mut paths = self;
         for (i, name) in parts.iter().enumerate() {
             let name = *name;
             if !paths.perm.indexonly() {
                 perm = paths.perm;
+                acl = paths.acl;
             }
             let child = match paths.children.get(name) {
                 Some(child) => child,
@@ -359,7 +438,7 @@ impl AccessPaths {
                         return if perm.indexonly() {
                             None
                         } else {
-                            Some(AccessPaths::new(perm))
+                            Some(AccessPaths::new_with_acl(perm, acl))
                         }
                     }
                 },
@@ -368,11 +447,12 @@ impl AccessPaths {
         }
         if !paths.perm.indexonly() {
             perm = paths.perm;
+            acl = paths.acl;
         }
         if perm.indexonly() {
             Some(paths.clone())
         } else {
-            Some(AccessPaths::new(perm))
+            Some(AccessPaths::new_with_acl(perm, acl))
         }
     }
 
@@ -387,6 +467,7 @@ impl AccessPaths {
         find_child_alias(&self.children, name, prefix, root).await
     }
 
+    #[allow(dead_code)]
     pub fn child_names(&self) -> Vec<&String> {
         self.children.keys().collect()
     }
@@ -465,6 +546,28 @@ impl AccessPerm {
     pub fn readwrite(&self) -> bool {
         self == &AccessPerm::ReadWrite
     }
+}
+
+/// Parse a path permission suffix. `x` grants acl management; `w` implies `r`.
+fn parse_perm_flags(flags: &str) -> Option<(AccessPerm, bool)> {
+    if flags == "ro" {
+        return Some((AccessPerm::ReadOnly, false));
+    }
+    if flags.is_empty() || !flags.chars().all(|c| matches!(c, 'r' | 'w' | 'x')) {
+        return None;
+    }
+    let acl = flags.contains('x');
+    let write = flags.contains('w');
+    let read = flags.contains('r') || write;
+    if !read && !acl {
+        return None;
+    }
+    let perm = if write {
+        AccessPerm::ReadWrite
+    } else {
+        AccessPerm::ReadOnly
+    };
+    Some((perm, acl))
 }
 
 pub fn www_authenticate(res: &mut Response, args: &Args) -> Result<()> {
@@ -657,7 +760,7 @@ fn is_plain_name(name: &str) -> bool {
         && !name.ends_with(' ')
 }
 
-fn is_readonly_method(method: &Method) -> bool {
+pub(crate) fn is_readonly_method(method: &Method) -> bool {
     method == Method::GET
         || method == Method::OPTIONS
         || method == Method::HEAD
@@ -784,6 +887,68 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_empty_paths_grant_nothing() {
+        let mut paths = AccessPaths::default();
+        assert!(paths.merge("").is_some());
+        assert!(paths.find("readme.txt", None).await.is_none());
+    }
+
+    #[test]
+    fn test_perm_flags() {
+        assert_eq!(parse_perm_flags("ro"), Some((AccessPerm::ReadOnly, false)));
+        assert_eq!(parse_perm_flags("rw"), Some((AccessPerm::ReadWrite, false)));
+        assert_eq!(parse_perm_flags("rx"), Some((AccessPerm::ReadOnly, true)));
+        assert_eq!(parse_perm_flags("rwx"), Some((AccessPerm::ReadWrite, true)));
+        assert_eq!(parse_perm_flags("x"), Some((AccessPerm::ReadOnly, true)));
+        assert_eq!(parse_perm_flags("w"), Some((AccessPerm::ReadWrite, false)));
+        assert_eq!(parse_perm_flags("z"), None);
+        assert_eq!(parse_perm_flags(""), None);
+    }
+
+    #[tokio::test]
+    async fn test_x_inheritance_and_override() {
+        let mut paths = AccessPaths::default();
+        paths.merge("/a:rwx,/b:ro,/a/b:rw").unwrap();
+        assert!(paths.find("a", None).await.unwrap().acl());
+        assert!(paths.find("a/c", None).await.unwrap().acl());
+        assert!(!paths.find("b", None).await.unwrap().acl());
+        // a child rule without x resets the inherited x
+        assert!(!paths.find("a/b", None).await.unwrap().acl());
+        assert!(!paths.find("a/b/c", None).await.unwrap().acl());
+    }
+
+    #[tokio::test]
+    async fn test_x_users() {
+        let dir = assert_fs::TempDir::new().unwrap();
+        let root = dir.path();
+        let ac = AccessControl::new(&[
+            "admin:admin@/:rwx",
+            "alice:alice@/data:rx",
+            "bob:bob@/data:ro",
+            "@/",
+        ])
+        .unwrap();
+        let users = ac.x_users("data", root).await;
+        assert!(users.contains(&"admin".to_string()));
+        assert!(users.contains(&"alice".to_string()));
+        assert!(!users.contains(&"bob".to_string()));
+        assert!(!users.contains(&"guest".to_string()));
+        let users = ac.x_users("elsewhere", root).await;
+        assert_eq!(users, vec!["admin".to_string()]);
+
+        // an anonymous x is reported as guest
+        let ac = AccessControl::new(&["@/:rwx"]).unwrap();
+        assert_eq!(ac.x_users("x", root).await, vec!["guest".to_string()]);
+
+        // a guest user with x and an admin with x are both listed
+        let ac = AccessControl::new(&["guest:guest@/guest:rwx", "admin:admin@/:rwx"]).unwrap();
+        let users = ac.x_users("guest", root).await;
+        assert_eq!(users.len(), 2);
+        assert!(users.contains(&"guest".to_string()));
+        assert!(users.contains(&"admin".to_string()));
+    }
+
     #[test]
     fn test_compact_split_rules() {
         assert_eq!(
@@ -803,12 +968,12 @@ mod tests {
     #[tokio::test]
     async fn test_access_paths() {
         let mut paths = AccessPaths::default();
-        paths.add("/dir1", AccessPerm::ReadWrite);
-        paths.add("/dir2/dir21", AccessPerm::ReadWrite);
-        paths.add("/dir2/dir21/dir211", AccessPerm::ReadOnly);
-        paths.add("/dir2/dir22", AccessPerm::ReadOnly);
-        paths.add("/dir2/dir22/dir221", AccessPerm::ReadWrite);
-        paths.add("/dir2/dir23/dir231", AccessPerm::ReadWrite);
+        paths.add("/dir1", AccessPerm::ReadWrite, false);
+        paths.add("/dir2/dir21", AccessPerm::ReadWrite, false);
+        paths.add("/dir2/dir21/dir211", AccessPerm::ReadOnly, false);
+        paths.add("/dir2/dir22", AccessPerm::ReadOnly, false);
+        paths.add("/dir2/dir22/dir221", AccessPerm::ReadWrite, false);
+        paths.add("/dir2/dir23/dir231", AccessPerm::ReadWrite, false);
         assert_eq!(
             paths.entry_paths(Path::new("/tmp")),
             [
@@ -889,9 +1054,9 @@ mod tests {
         dir.child("Protected/file.txt").write_str("x").unwrap();
 
         let mut paths = AccessPaths::default();
-        paths.add("/", AccessPerm::ReadWrite);
-        paths.add("/dir1/test.txt", AccessPerm::ReadOnly);
-        paths.add("/Protected", AccessPerm::ReadOnly);
+        paths.add("/", AccessPerm::ReadWrite, false);
+        paths.add("/dir1/test.txt", AccessPerm::ReadOnly, false);
+        paths.add("/Protected", AccessPerm::ReadOnly, false);
 
         let root = Some(dir.path());
         // exact spellings

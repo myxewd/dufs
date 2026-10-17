@@ -11,6 +11,16 @@ All notable changes to this project will be documented in this file.
 - Add `--trusted-proxy` so the IP whitelist works behind a reverse proxy via `X-Forwarded-For`/`X-Real-IP`
 - Add an OIDC authentication adapter (`--auth-type oidc`), using the provider username with the existing `--auth` roles
 - Treat unauthenticated requests as a configurable `guest` identity, and add a Login button that starts the configured authentication
+- Add the `x` permission and per-user allow-read/allow-write/deny-read acl rules, editable from the WebUI
+- Add an acl save diff with optimistic concurrency, and `Read`/`Write` summary columns to the WebUI
+- Fix Digest authentication for ACL writes and force a fresh login challenge for the guest identity
+- Fix `x` users being filtered out of listings, search and archives by the acl
+- Show inherited acl entries read-only, save only the target's own entries and fix the missing save diff
+- Drop `?login` after login, fix the rule chain in the acl diff, and refresh the dialogs (dark mode, tag editor, full-width details list)
+- Hide the acl summary from non-x users, drop empty summary columns, and keep the metadata store out of archives
+- Keep the acl dialog open on backdrop clicks, put locked inherited tags first, and add a filter to the full-list dialog
+- Fix the guest archive leaking the metadata dir, filter archives by the effective access, use an eye icon for the view action, and serve the plain favicon without an auth challenge
+- OIDC: keep the guest page visible without a session and log out through the provider end-session endpoint with an id_token hint
 
 ## [0.46.0] - 2026-05-07
 

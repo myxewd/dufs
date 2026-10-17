@@ -209,6 +209,23 @@ impl IpWhitelist {
         node.ips = Some(ips);
     }
 
+    /// Remove the path's own rule (the subtree is left untouched).
+    pub fn remove(&mut self, path: &str) {
+        let parts: Vec<&str> = path
+            .trim_matches('/')
+            .split('/')
+            .filter(|v| !v.is_empty())
+            .collect();
+        let mut node = &mut self.root;
+        for part in &parts {
+            match node.children.get_mut(*part) {
+                Some(child) => node = child,
+                None => return,
+            }
+        }
+        node.ips = None;
+    }
+
     /// Whether any rule is configured at all.
     pub fn is_empty(&self) -> bool {
         self.root.ips.is_none() && self.root.children.is_empty()

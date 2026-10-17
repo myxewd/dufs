@@ -4,9 +4,9 @@ use headers::HeaderMap;
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata};
 use openidconnect::reqwest;
 use openidconnect::{
-    AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet, EndpointNotSet,
-    EndpointSet, IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
-    TokenResponse,
+    AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndSessionUrl, EndpointMaybeSet,
+    EndpointNotSet, EndpointSet, IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier,
+    RedirectUrl, Scope, TokenResponse,
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -34,6 +34,7 @@ pub struct OidcConfig {
     pub client_id: String,
     pub client_secret: Option<String>,
     pub redirect_uri: String,
+    pub post_logout_redirect_uri: Option<String>,
     pub scopes: Vec<String>,
     pub username_claim: String,
     pub session_ttl: Duration,
@@ -55,6 +56,12 @@ impl OidcConfig {
         let redirect_uri = env_var("DUFS_OIDC_REDIRECT_URI").ok_or_else(|| {
             anyhow!("DUFS_OIDC_REDIRECT_URI is required when the auth type is oidc")
         })?;
+        let post_logout_redirect_uri =
+            env_var("DUFS_OIDC_POST_LOGOUT_REDIRECT_URI").or_else(|| {
+                redirect_uri
+                    .strip_suffix("__dufs__/oidc/callback")
+                    .map(|value| value.to_string())
+            });
         let scopes = env_var("DUFS_OIDC_SCOPES")
             .unwrap_or_else(|| "openid profile email".to_string())
             .split_whitespace()
@@ -70,6 +77,7 @@ impl OidcConfig {
             client_id,
             client_secret: env_var("DUFS_OIDC_CLIENT_SECRET"),
             redirect_uri,
+            post_logout_redirect_uri,
             scopes,
             username_claim,
             session_ttl: Duration::from_secs(session_hours.saturating_mul(3600)),
@@ -86,6 +94,7 @@ struct PendingLogin {
 
 struct Session {
     username: String,
+    id_token: Option<String>,
     expires: Instant,
 }
 
@@ -94,6 +103,7 @@ pub struct Oidc {
     config: OidcConfig,
     http: reqwest::Client,
     client: Mutex<Option<OidcClient>>,
+    end_session: Mutex<Option<Option<EndSessionUrl>>>,
     pending: Mutex<HashMap<String, PendingLogin>>,
     sessions: Mutex<HashMap<String, Session>>,
 }
@@ -112,6 +122,7 @@ impl Oidc {
             config,
             http,
             client: Mutex::new(None),
+            end_session: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
         })
@@ -119,6 +130,50 @@ impl Oidc {
 
     pub fn session_ttl(&self) -> Duration {
         self.config.session_ttl
+    }
+
+    async fn end_session_endpoint(&self) -> Result<Option<EndSessionUrl>> {
+        if let Some(cached) = self.end_session.lock().unwrap().as_ref() {
+            return Ok(cached.clone());
+        }
+        let url = format!(
+            "{}/.well-known/openid-configuration",
+            self.config.issuer.trim_end_matches('/')
+        );
+        let body = self
+            .http
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        let value: serde_json::Value = serde_json::from_str(&body)?;
+        let endpoint = value
+            .get("end_session_endpoint")
+            .and_then(|value| value.as_str())
+            .and_then(|value| EndSessionUrl::new(value.to_string()).ok());
+        *self.end_session.lock().unwrap() = Some(endpoint.clone());
+        Ok(endpoint)
+    }
+
+    /// Build the RP-initiated logout url, including the id_token hint when known.
+    pub async fn end_session_url(&self, id_token: Option<&str>) -> Result<Option<String>> {
+        let Some(endpoint) = self.end_session_endpoint().await? else {
+            return Ok(None);
+        };
+        let mut url = endpoint.url().to_owned();
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("client_id", &self.config.client_id);
+            if let Some(hint) = id_token {
+                query.append_pair("id_token_hint", hint);
+            }
+            if let Some(post) = &self.config.post_logout_redirect_uri {
+                query.append_pair("post_logout_redirect_uri", post);
+            }
+        }
+        Ok(Some(url.to_string()))
     }
 
     async fn provider_client(&self) -> Result<OidcClient> {
@@ -151,6 +206,10 @@ impl Oidc {
             )
             .set_pkce_challenge(challenge);
         for scope in &self.config.scopes {
+            // `authorize_url` already adds the mandatory `openid` scope.
+            if scope.as_str() == "openid" {
+                continue;
+            }
             request = request.add_scope(Scope::new(scope.clone()));
         }
         let (url, csrf, nonce) = request.url();
@@ -168,7 +227,11 @@ impl Oidc {
     }
 
     /// Exchange the authorization code and return the username and return path.
-    pub async fn complete_login(&self, code: String, state: String) -> Result<(String, String)> {
+    pub async fn complete_login(
+        &self,
+        code: String,
+        state: String,
+    ) -> Result<(String, String, Option<String>)> {
         let pending = {
             let mut pending = self.pending.lock().unwrap();
             pending.retain(|_, value| value.expires > Instant::now());
@@ -195,10 +258,10 @@ impl Oidc {
             .and_then(|value| value.as_str().map(|value| value.to_string()))
             .ok_or_else(|| anyhow!("failed to read the raw id_token"))?;
         let username = extract_username(&raw, &self.config.username_claim)?;
-        Ok((username, pending.next))
+        Ok((username, pending.next, Some(raw)))
     }
 
-    pub fn create_session(&self, username: String) -> String {
+    pub fn create_session(&self, username: String, id_token: Option<String>) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         let mut sessions = self.sessions.lock().unwrap();
         sessions.retain(|_, session| session.expires > Instant::now());
@@ -206,10 +269,24 @@ impl Oidc {
             id.clone(),
             Session {
                 username,
+                id_token,
                 expires: Instant::now() + self.config.session_ttl,
             },
         );
         id
+    }
+
+    /// The raw id_token stored for this session, used as the logout hint.
+    pub fn session_id_token(&self, id: &str) -> Option<String> {
+        let mut sessions = self.sessions.lock().unwrap();
+        match sessions.get(id) {
+            Some(session) if session.expires > Instant::now() => session.id_token.clone(),
+            Some(_) => {
+                sessions.remove(id);
+                None
+            }
+            None => None,
+        }
     }
 
     pub fn session_user(&self, id: &str) -> Option<String> {

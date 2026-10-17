@@ -62,7 +62,9 @@ const ICONS = {
   move: `<svg width="16" height="16" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M1.5 1.5A.5.5 0 0 0 1 2v4.8a2.5 2.5 0 0 0 2.5 2.5h9.793l-3.347 3.346a.5.5 0 0 0 .708.708l4.2-4.2a.5.5 0 0 0 0-.708l-4-4a.5.5 0 0 0-.708.708L13.293 8.3H3.5A1.5 1.5 0 0 1 2 6.8V2a.5.5 0 0 0-.5-.5z"/></svg>`,
   edit: `<svg width="16" height="16" viewBox="0 0 16 16"><path d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168l10-10zM11.207 2.5 13.5 4.793 14.793 3.5 12.5 1.207 11.207 2.5zm1.586 3L10.5 3.207 4 9.707V10h.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.5h.293l6.5-6.5zm-9.761 5.175-.106.106-1.528 3.821 3.821-1.528.106-.106A.5.5 0 0 1 5 12.5V12h-.5a.5.5 0 0 1-.5-.5V11h-.5a.5.5 0 0 1-.468-.325z"/></svg>`,
   delete: `<svg width="16" height="16" viewBox="0 0 16 16"><path d="M6.854 7.146a.5.5 0 1 0-.708.708L7.293 9l-1.147 1.146a.5.5 0 0 0 .708.708L8 9.707l1.146 1.147a.5.5 0 0 0 .708-.708L8.707 9l1.147-1.146a.5.5 0 0 0-.708-.708L8 8.293 6.854 7.146z"/><path d="M14 14V4.5L9.5 0H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2zM9.5 3A1.5 1.5 0 0 0 11 4.5h2V14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1h5.5v2z"/></svg>`,
-  view: `<svg width="16" height="16" viewBox="0 0 16 16"><path d="M4 0a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V2a2 2 0 0 0-2-2zm0 1h8a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1"/></svg>`,
+  // open-in-new: a box with an outbound arrow, drawn with filled paths so it
+  // inherits the same `svg { fill: var(--svg-primary) }` as the other actions
+  view: `<svg width="16" height="16" viewBox="0 0 16 16"><path d="M8.636 3.5a.5.5 0 0 0-.5-.5H1.5A1.5 1.5 0 0 0 0 4.5v10A1.5 1.5 0 0 0 1.5 16h10a1.5 1.5 0 0 0 1.5-1.5V7.864a.5.5 0 0 0-1 0V14.5a.5.5 0 0 1-.5.5h-10a.5.5 0 0 1-.5-.5v-10a.5.5 0 0 1 .5-.5h6.636a.5.5 0 0 0 .5-.5z"/><path d="M16 .5a.5.5 0 0 0-.5-.5h-5a.5.5 0 0 0 0 1h3.793L6.146 9.146a.5.5 0 1 0 .708.708L15 1.707V5.5a.5.5 0 0 0 1 0v-5z"/></svg>`,
   shield: `<svg width="16" height="16" viewBox="0 0 16 16"><path d="M8 0c-.7 1.3-2.2 2.1-4 2.1v5c0 3.2 1.9 6 4 6.9 2.1-.9 4-3.7 4-6.9v-5C10.2 2.1 8.7 1.3 8 0zm0 1.6c.9.6 1.9 1 3 1.2v4.8c0 2.2-1.2 4.2-3 5.3-1.8-1.1-3-3.1-3-5.3V2.8c1.1-.2 2.1-.6 3-1.2z"/></svg>`,
 }
 
@@ -447,6 +449,8 @@ async function setupIndexPage() {
     setupIpWhitelist();
   }
 
+  setupAclDetails();
+
   renderPathsTableHead();
   renderPathsTableBody();
 
@@ -458,6 +462,10 @@ async function setupIndexPage() {
 /**
  * Render path table thead
  */
+function hasAclColumn(list) {
+  return DATA.has_acl && (DATA.paths || []).some(p => p[list]);
+}
+
 function renderPathsTableHead() {
   const headerItems = [
     {
@@ -493,6 +501,8 @@ function renderPathsTableHead() {
     const icon = `<span>${svg}</span>`
     return `<th class="cell-${item.name}" ${item.props}><a href="?${qs}">${item.text}${icon}</a></th>`
   }).join("\n")}
+      ${hasAclColumn("allow_read") ? `<th class="cell-acl-read">Read</th>` : ""}
+      ${hasAclColumn("allow_write") ? `<th class="cell-acl-write">Write</th>` : ""}
       ${DATA.allow_ip_whitelist ? `<th class="cell-whitelist">Whitelist</th>` : ""}
       <th class="cell-actions">Actions</th>
     </tr>
@@ -557,7 +567,7 @@ function addPath(file, index) {
     <div onclick="deletePath(${index})" class="action-btn" id="deleteBtn${index}" title="Delete">${ICONS.delete}</div>`;
   }
   if (!actionEdit && !isDir) {
-    actionView = `<a class="action-btn" title="View file" target="_blank" href="${url}?view">${ICONS.view}</a>`;
+    actionView = `<a class="action-btn" title="Open file" target="_blank" href="${url}?view">${ICONS.view}</a>`;
   }
   if (DATA.allow_ip_whitelist) {
     actionWhitelist = `<div onclick="manageWhitelist(${index})" class="action-btn" title="IP whitelist">${ICONS.shield}</div>`;
@@ -584,7 +594,9 @@ function addPath(file, index) {
   </td>
   <td class="cell-mtime">${formatMtime(file.mtime)}</td>
   <td class="cell-size">${sizeDisplay}</td>
-  ${DATA.allow_ip_whitelist ? `<td class="cell-whitelist">${whitelistCell(file.whitelist)}</td>` : ""}
+  ${hasAclColumn("allow_read") ? `<td class="cell-acl-read">${listCell(file.allow_read)}</td>` : ""}
+  ${hasAclColumn("allow_write") ? `<td class="cell-acl-write">${listCell(file.allow_write)}</td>` : ""}
+  ${DATA.allow_ip_whitelist ? `<td class="cell-whitelist">${listCell(file.whitelist)}</td>` : ""}
   ${actionCell}
 </tr>`);
 }
@@ -621,7 +633,6 @@ async function setupAuth() {
   } else {
     // Unauthenticated visitors are the `guest` identity; the login button
     // starts whichever authentication the server is configured for.
-    document.querySelector(".guest-name")?.classList.remove("hidden");
     $loginBtn.classList.remove("hidden");
     $loginBtn.addEventListener("click", () => {
       location.href = baseUrl() + "?login";
@@ -702,28 +713,133 @@ function setupNewFile() {
   });
 }
 
-var WHITELIST_RULES = {};
-var WHITELIST_PATH = "";
+var ACL_PATH = "";
+var ACL_VERSION = "";
+var ACL_X_USERS = [];
+var ACL_CHAIN = [];
+var ACL_OWN_BEFORE = { allow_read: [], allow_write: [], deny_read: [] };
+var ACL_INHERITED = { allow_read: [], allow_write: [], deny_read: [] };
+var ACL_BEFORE = { allow_read: [], allow_write: [], deny_read: [] };
+var ACL_DATA = { ips: [], allow_read: [], allow_write: [], deny_read: [] };
 
 function setupIpWhitelist() {
   const $modal = document.getElementById("whitelistModal");
   const $btn = document.querySelector(".ip-whitelist-btn");
   $btn.classList.remove("hidden");
   $btn.addEventListener("click", () => openWhitelistModal(currentDirPath()));
-  $modal.querySelector(".modal-close").addEventListener("click", () => $modal.classList.add("hidden"));
-  $modal.addEventListener("click", e => {
-    if (e.target === $modal) $modal.classList.add("hidden");
-  });
+
+  for (const id of ["whitelistModal", "aclDiffModal"]) {
+    const $m = document.getElementById(id);
+    // Closing only happens through the explicit X / Confirm buttons;
+    // clicking the backdrop must not discard an edit in progress.
+    $m.querySelector(".modal-close").addEventListener("click", () => $m.classList.add("hidden"));
+  }
+
   $modal.querySelector(".save-rule-btn").addEventListener("click", saveWhitelist);
   $modal.querySelector(".remove-rule-btn").addEventListener("click", removeWhitelist);
+
+  const $diff = document.getElementById("aclDiffModal");
+  $diff.querySelector(".acl-diff-cancel").addEventListener("click", () => $diff.classList.add("hidden"));
+  $diff.querySelector(".acl-diff-confirm").addEventListener("click", confirmAclSave);
+
+  $modal.querySelectorAll(".acl-tab").forEach(tab => {
+    tab.addEventListener("click", () => {
+      const list = tab.getAttribute("data-list");
+      $modal.querySelectorAll(".acl-tab").forEach(t => t.classList.toggle("active", t === tab));
+      $modal.querySelectorAll(".acl-panel").forEach(panel => {
+        panel.classList.toggle("hidden", panel.getAttribute("data-panel") !== list);
+      });
+    });
+  });
+
+  $modal.addEventListener("click", e => {
+    const remove = e.target.closest(".acl-tag-remove");
+    if (!remove) return;
+    const list = remove.getAttribute("data-list");
+    const user = remove.getAttribute("data-user");
+    if (user) {
+      removeAclMember(list, user);
+      renderAclLists();
+      $modal.querySelector(`.acl-tags[data-list="${list}"] .acl-tag-input`)?.focus();
+    }
+  });
+
+  $modal.addEventListener("click", e => {
+    const $tags = e.target.closest(".acl-tags");
+    if (!$tags || e.target.closest(".acl-tag-remove")) return;
+    $tags.querySelector(".acl-tag-input")?.focus();
+  });
+
+  $modal.addEventListener("keydown", e => {
+    if (!e.target.classList.contains("acl-tag-input")) return;
+    if (e.key !== "Enter" && e.key !== "Tab") return;
+    const value = e.target.value.trim();
+    if (!value) return;
+    e.preventDefault();
+    const $tags = e.target.closest(".acl-tags");
+    const list = $tags.getAttribute("data-list");
+    if (list === "deny_read" && ACL_X_USERS.includes(value)) {
+      alert(`${value} has x and cannot be denied.`);
+      return;
+    }
+    addAclMember(list, value);
+    renderAclLists();
+    $modal.querySelector(`.acl-tags[data-list="${list}"] .acl-tag-input`)?.focus();
+  });
+
+}
+
+var LIST_DETAILS_ITEMS = [];
+var LIST_DETAILS_FILTER = "";
+
+function setupAclDetails() {
+  const $details = document.getElementById("listDetailsModal");
+  if (!$details) return;
+  $details.querySelector(".modal-close").addEventListener("click", () => $details.classList.add("hidden"));
+  $details.addEventListener("click", e => {
+    if (e.target === $details) $details.classList.add("hidden");
+  });
+  const $search = $details.querySelector(".list-details-search");
+  $search.addEventListener("keydown", e => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    LIST_DETAILS_FILTER = e.target.value.trim();
+    e.target.value = "";
+    renderListDetails();
+  });
+  document.addEventListener("click", e => {
+    const link = e.target.closest(".acl-list-link");
+    if (!link) return;
+    e.preventDefault();
+    LIST_DETAILS_ITEMS = (link.getAttribute("data-full") || "").split(", ").filter(Boolean);
+    LIST_DETAILS_FILTER = "";
+    $search.value = "";
+    renderListDetails();
+    $details.classList.remove("hidden");
+    $search.focus();
+  });
+}
+
+function renderListDetails() {
+  const $details = document.getElementById("listDetailsModal");
+  const filter = LIST_DETAILS_FILTER.toLowerCase();
+  const items = filter
+    ? LIST_DETAILS_ITEMS.filter(item => item.toLowerCase().includes(filter))
+    : LIST_DETAILS_ITEMS;
+  $details.querySelector(".modal-head b").textContent = LIST_DETAILS_FILTER
+    ? `Full list - ${LIST_DETAILS_FILTER}`
+    : "Full list";
+  $details.querySelector(".list-details-body").innerHTML = items.length
+    ? `<ul class="list-details">${items.map(item => `<li>${encodedStr(item)}</li>`).join("")}</ul>`
+    : `<div class="list-details-empty">No matches</div>`;
 }
 
 function currentDirPath() {
   return DATA.href === "/" ? "/" : DATA.href;
 }
 
-function whitelistUrl() {
-  return DATA.uri_prefix + "__dufs__/ip-whitelist";
+function aclUrl(path) {
+  return DATA.uri_prefix + "__dufs__/acl?path=" + encodeURIComponent(path);
 }
 
 async function openWhitelistModal(path) {
@@ -731,33 +847,126 @@ async function openWhitelistModal(path) {
   $modal.querySelector(".modal-status").textContent = "";
   $modal.classList.remove("hidden");
   $modal.querySelector(".whitelist-path").textContent = path;
-  const $input = $modal.querySelector(".whitelist-input");
-  $input.value = "";
   try {
-    const res = await fetch(whitelistUrl() + "?path=" + encodeURIComponent(path));
+    const res = await fetch(aclUrl(path));
     await assertResOK(res);
     const data = await res.json();
-    WHITELIST_RULES = data.rules || {};
-    WHITELIST_PATH = path;
-    $input.value = initialWhitelistInput(path, WHITELIST_RULES, data.effective);
-    $input.focus();
+    ACL_PATH = path;
+    ACL_VERSION = data.version || "";
+    ACL_X_USERS = data.x_users || [];
+    ACL_CHAIN = data.chain || [];
+    const own = data.own || {};
+    const inherited = data.inherited || {};
+    ACL_OWN_BEFORE = {
+      allow_read: [...(own.allow_read || [])],
+      allow_write: [...(own.allow_write || [])],
+      deny_read: [...(own.deny_read || [])],
+    };
+    ACL_INHERITED = {
+      allow_read: [...(inherited.allow_read || [])],
+      allow_write: [...(inherited.allow_write || [])],
+      deny_read: [...(inherited.deny_read || [])],
+    };
+    ACL_BEFORE = effectiveLists(ACL_OWN_BEFORE, ACL_INHERITED);
+    ACL_DATA = {
+      ips: data.ips === null || data.ips === undefined ? ["0.0.0.0/0", "::/0"] : data.ips,
+      allow_read: [...ACL_OWN_BEFORE.allow_read],
+      allow_write: [...ACL_OWN_BEFORE.allow_write],
+      deny_read: [...ACL_OWN_BEFORE.deny_read],
+    };
+    $modal.querySelector(".whitelist-input").value = ACL_DATA.ips.join(", ");
+    renderAclLists();
   } catch (err) {
     $modal.classList.add("hidden");
-    alert(`Failed to load ip whitelist, ${err.message}`);
+    alert(`Failed to load acl, ${err.message}`);
   }
 }
 
-// Pre-fill the editor with the whitelist that currently applies to the path.
-// A path without a rule of its own is unrestricted, which is shown as 0.0.0.0/0,
-// so an empty input always means "blocked".
-function initialWhitelistInput(path, rules, effective) {
-  if (Object.prototype.hasOwnProperty.call(rules, path)) {
-    return (rules[path] || []).join(", ");
+function normalizeAclLists() {
+  ACL_DATA.allow_read = ACL_DATA.allow_read.filter(u => !ACL_DATA.deny_read.includes(u));
+  ACL_DATA.allow_write = ACL_DATA.allow_write.filter(u => !ACL_DATA.deny_read.includes(u));
+  for (const user of ACL_DATA.allow_write) {
+    if (!ACL_DATA.allow_read.includes(user)) ACL_DATA.allow_read.push(user);
   }
-  if (effective === null || effective === undefined) {
-    return "0.0.0.0/0";
+  for (const list of ["allow_read", "allow_write", "deny_read"]) {
+    ACL_DATA[list] = [...new Set(ACL_DATA[list])];
   }
-  return effective.join(", ");
+}
+
+function addAclMember(list, user) {
+  if (!ACL_DATA[list] || !user) return;
+  // x users always win over the acl and cannot be denied
+  if (list === "deny_read" && ACL_X_USERS.includes(user)) return;
+  if (list === "deny_read") {
+    ACL_DATA.allow_read = ACL_DATA.allow_read.filter(u => u !== user);
+    ACL_DATA.allow_write = ACL_DATA.allow_write.filter(u => u !== user);
+  } else if (list === "allow_write") {
+    ACL_DATA.deny_read = ACL_DATA.deny_read.filter(u => u !== user);
+    if (!ACL_DATA.allow_read.includes(user)) ACL_DATA.allow_read.push(user);
+  } else {
+    ACL_DATA.deny_read = ACL_DATA.deny_read.filter(u => u !== user);
+  }
+  if (!ACL_DATA[list].includes(user)) ACL_DATA[list].push(user);
+  normalizeAclLists();
+}
+
+function removeAclMember(list, user) {
+  if (!ACL_DATA[list]) return;
+  ACL_DATA[list] = ACL_DATA[list].filter(u => u !== user);
+  if (list === "allow_read") {
+    ACL_DATA.allow_write = ACL_DATA.allow_write.filter(u => u !== user);
+  }
+  normalizeAclLists();
+}
+
+function ownMentioned(own) {
+  return new Set([...own.allow_read, ...own.allow_write, ...own.deny_read]);
+}
+
+function effectiveLists(own, inherited) {
+  const mentioned = ownMentioned(own);
+  const out = {
+    allow_read: [...own.allow_read],
+    allow_write: [...own.allow_write],
+    deny_read: [...own.deny_read],
+  };
+  for (const list of ["allow_read", "allow_write", "deny_read"]) {
+    for (const user of inherited[list] || []) {
+      if (!mentioned.has(user) && !out[list].includes(user)) out[list].push(user);
+    }
+  }
+  return out;
+}
+
+function renderAclLists() {
+  const $modal = document.getElementById("whitelistModal");
+  const mentioned = ownMentioned(ACL_DATA);
+  for (const list of ["allow_read", "allow_write", "deny_read"]) {
+    const $tags = $modal.querySelector(`.acl-tags[data-list="${list}"]`);
+    if (!$tags) continue;
+    const own = list === "deny_read"
+      ? ACL_DATA[list].filter(user => !ACL_X_USERS.includes(user))
+      : ACL_DATA[list];
+    const inherited = (ACL_INHERITED[list] || []).filter(
+      user => !mentioned.has(user) && !own.includes(user),
+    );
+    const tags = [
+      // inherited (locked) tags are always kept in front of the editable ones
+      ...inherited.map(user => tagHtml(user, list, true)),
+      ...own.map(user => tagHtml(user, list, false)),
+      `<input class="acl-tag-input" type="text" spellcheck="false" autocomplete="off" placeholder="Add a user and press Tab">`,
+    ];
+    $tags.innerHTML = tags.join("");
+  }
+}
+
+function tagHtml(user, list, inherited) {
+  const mark = ACL_X_USERS.includes(user) ? '<span class="acl-x-mark">*</span>' : "";
+  const name = `${encodedStr(user)}${mark}`;
+  if (inherited) {
+    return `<span class="acl-tag acl-tag-locked">${name}</span>`;
+  }
+  return `<span class="acl-tag">${name}<button class="acl-tag-remove" type="button" data-list="${list}" data-user="${encodedStr(user)}" title="Remove">&times;</button></span>`;
 }
 
 function parseWhitelistInput(value) {
@@ -767,52 +976,143 @@ function parseWhitelistInput(value) {
     .filter(v => v.length > 0);
 }
 
-async function putWhitelist(rules) {
-  const res = await fetch(whitelistUrl(), {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ version: 1, rules }),
-  });
-  await assertResOK(res);
-}
-
-function whitelistCell(value) {
+function listCell(value) {
   if (value === "blocked") {
     return `<span class="whitelist-blocked">blocked</span>`;
   }
-  return encodedStr(value || "");
+  if (!value) return "";
+  const full = String(value);
+  if (full.length <= 24) return encodedStr(full);
+  return `<a href="#" class="acl-list-link" data-full="${encodedStr(full)}">${encodedStr(full.slice(0, 24))}...</a>`;
+}
+
+function aclPermOf(lists, user) {
+  if ((lists.deny_read || []).includes(user)) return "-";
+  if ((lists.allow_write || []).includes(user)) return "rw";
+  if ((lists.allow_read || []).includes(user)) return "r";
+  return "-";
+}
+
+function aclChanges() {
+  const after = effectiveLists(ACL_DATA, ACL_INHERITED);
+  const users = new Set([
+    ...ACL_BEFORE.allow_read, ...ACL_BEFORE.allow_write, ...ACL_BEFORE.deny_read,
+    ...after.allow_read, ...after.allow_write, ...after.deny_read,
+    ...ACL_OWN_BEFORE.allow_read, ...ACL_OWN_BEFORE.allow_write, ...ACL_OWN_BEFORE.deny_read,
+    ...ACL_DATA.allow_read, ...ACL_DATA.allow_write, ...ACL_DATA.deny_read,
+  ]);
+  const changes = [];
+  for (const user of users) {
+    const beforeAllow = ACL_BEFORE.allow_read.includes(user) || ACL_BEFORE.allow_write.includes(user);
+    const afterAllow = after.allow_read.includes(user) || after.allow_write.includes(user);
+    const beforeDeny = ACL_BEFORE.deny_read.includes(user);
+    const afterDeny = after.deny_read.includes(user);
+    const ownBeforeAllow = ACL_OWN_BEFORE.allow_read.includes(user) || ACL_OWN_BEFORE.allow_write.includes(user);
+    const ownAfterAllow = ACL_DATA.allow_read.includes(user) || ACL_DATA.allow_write.includes(user);
+    const ownBeforeDeny = ACL_OWN_BEFORE.deny_read.includes(user);
+    const ownAfterDeny = ACL_DATA.deny_read.includes(user);
+    const kinds = [];
+    if (!beforeAllow && afterAllow) kinds.push("add allow");
+    if (!beforeDeny && afterDeny) kinds.push("add deny (also revokes write)");
+    if (ownBeforeAllow && !ownAfterAllow) kinds.push("remove allow (fall back to inheritance)");
+    if (ownBeforeDeny && !ownAfterDeny) kinds.push("remove deny (fall back to inheritance)");
+    if (kinds.length === 0) continue;
+    changes.push({
+      user,
+      before: aclPermOf(ACL_BEFORE, user),
+      after: aclPermOf(after, user),
+      kinds,
+    });
+  }
+  return changes;
+}
+
+function showAclDiff(changes) {
+  const $diff = document.getElementById("aclDiffModal");
+  const lines = [`Path: ${ACL_PATH}`];
+  for (const change of changes) {
+    lines.push("");
+    lines.push(`${change.user}: current ${change.before} -> target ${change.after}`);
+    for (const kind of change.kinds) lines.push(`  ${kind}`);
+  }
+  if (ACL_CHAIN.length > 0) {
+    lines.push("");
+    lines.push("Rule chain:");
+    for (const entry of ACL_CHAIN) {
+      const [path, rule] = entry;
+      const parts = [];
+      if (rule.allow_read) parts.push(`allow_read: ${rule.allow_read.join(", ") || "(empty)"}`);
+      if (rule.allow_write) parts.push(`allow_write: ${rule.allow_write.join(", ") || "(empty)"}`);
+      if (rule.deny_read) parts.push(`deny_read: ${rule.deny_read.join(", ") || "(empty)"}`);
+      lines.push(`  ${path}  ${parts.join("  ")}`);
+    }
+  }
+  $diff.querySelector(".acl-diff-body").textContent = lines.join("\n");
+  $diff.querySelector(".modal-status").textContent = "";
+  $diff.classList.remove("hidden");
 }
 
 async function saveWhitelist() {
+  normalizeAclLists();
+  const changes = aclChanges();
+  if (changes.length > 0) {
+    showAclDiff(changes);
+    return;
+  }
+  await putAcl();
+}
+
+async function putAcl() {
   const $modal = document.getElementById("whitelistModal");
   const $status = $modal.querySelector(".modal-status");
+  const $diff = document.getElementById("aclDiffModal");
+  const $diffStatus = $diff.querySelector(".modal-status");
   const ips = parseWhitelistInput($modal.querySelector(".whitelist-input").value);
-  const rules = { ...WHITELIST_RULES };
-  rules[WHITELIST_PATH] = ips;
   $status.textContent = "Saving...";
+  $diffStatus.textContent = "Saving...";
   try {
-    await putWhitelist(rules);
+    const res = await fetch(aclUrl(ACL_PATH), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        version: ACL_VERSION,
+        ips,
+        allow_read: ACL_DATA.allow_read,
+        allow_write: ACL_DATA.allow_write,
+        deny_read: ACL_DATA.deny_read,
+      }),
+    });
+    await assertResOK(res);
     $status.textContent = "Saved";
     location.reload();
   } catch (err) {
     $status.textContent = "";
-    alert(`Failed to save ip whitelist, ${err.message}`);
+    $diffStatus.textContent = "";
+    if (String(err.message).includes("modified") || String(err.message).includes("409")) {
+      alert("ACL has been modified by another user. Reload and try again.");
+    } else {
+      alert(`Failed to save acl, ${err.message}`);
+    }
   }
+}
+
+async function confirmAclSave() {
+  await putAcl();
 }
 
 async function removeWhitelist() {
   const $modal = document.getElementById("whitelistModal");
   const $status = $modal.querySelector(".modal-status");
-  const rules = { ...WHITELIST_RULES };
-  delete rules[WHITELIST_PATH];
   $status.textContent = "Saving...";
   try {
-    await putWhitelist(rules);
+    const url = aclUrl(ACL_PATH) + (ACL_VERSION ? "&version=" + encodeURIComponent(ACL_VERSION) : "");
+    const res = await fetch(url, { method: "DELETE" });
+    await assertResOK(res);
     $status.textContent = "Saved";
     location.reload();
   } catch (err) {
     $status.textContent = "";
-    alert(`Failed to remove ip whitelist rule, ${err.message}`);
+    alert(`Failed to remove acl rule, ${err.message}`);
   }
 }
 

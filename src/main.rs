@@ -9,6 +9,7 @@ mod noscript;
 mod oidc;
 mod server;
 mod trusted_proxy;
+mod user_acl;
 mod utils;
 
 #[macro_use]

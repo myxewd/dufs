@@ -1,0 +1,553 @@
+mod digest_auth_util;
+mod fixtures;
+mod utils;
+
+use assert_fs::fixture::TempDir;
+use digest_auth_util::send_with_digest_auth;
+use fixtures::{port, tmpdir, wait_for_port, Error, Port};
+use rstest::rstest;
+use std::process::{Child, Command, Stdio};
+
+fn client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client")
+}
+
+fn start_acl(tmpdir: &TempDir, port: &Port, guest: &str) -> Result<Child, Error> {
+    Ok(Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-A")
+        .arg("--auth")
+        .arg(guest)
+        .arg("--auth")
+        .arg("admin:admin@/:rwx")
+        .stdout(Stdio::null())
+        .spawn()?)
+}
+
+fn names(data: &serde_json::Value) -> Vec<String> {
+    data["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[rstest]
+fn acl_controls_read_write_and_x(tmpdir: TempDir, port: Port) -> Result<(), Error> {
+    let base = format!("http://localhost:{port}");
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-A")
+        .arg("--allow-ip-whitelist")
+        .arg("--auth")
+        .arg("guest:guest@/:ro")
+        .arg("--auth")
+        .arg("alice:alice@/dir2:ro")
+        .arg("--auth")
+        .arg("bob:bob@/dir2:ro")
+        .arg("--auth")
+        .arg("admin:admin@/:rwx")
+        .stdout(Stdio::null())
+        .spawn()?;
+    wait_for_port(&port);
+
+    // without x the acl is not editable
+    let resp = client()
+        .put(format!("{base}/__dufs__/acl?path=/dir1"))
+        .basic_auth("alice", Some("alice"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(
+            &serde_json::json!({ "allow_read": ["alice"] }),
+        )?)
+        .send()?;
+    assert!(resp.status().is_client_error(), "{}", resp.status());
+
+    // admin has x and can set the read/deny lists
+    let resp = client()
+        .put(format!("{base}/__dufs__/acl?path=/dir1"))
+        .basic_auth("admin", Some("admin"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&serde_json::json!({
+            "allow_read": ["alice"],
+            "deny_read": ["guest"],
+        }))?)
+        .send()?;
+    assert_eq!(resp.status(), 204);
+
+    // write implies read; bob may upload into /dir3
+    let resp = client()
+        .put(format!("{base}/__dufs__/acl?path=/dir3"))
+        .basic_auth("admin", Some("admin"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(
+            &serde_json::json!({ "allow_write": ["bob"] }),
+        )?)
+        .send()?;
+    assert_eq!(resp.status(), 204);
+
+    // alice gains read access to /dir1 even though --auth only grants /dir2
+    let resp = client()
+        .get(format!("{base}/dir1/test.txt"))
+        .basic_auth("alice", Some("alice"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+
+    // the acl denies guest on /dir1
+    let resp = client().get(format!("{base}/dir1/test.txt")).send()?;
+    assert_eq!(resp.status(), 403);
+
+    // bob may write and, because write implies read, read it back
+    let resp = client()
+        .put(format!("{base}/dir3/new.txt"))
+        .basic_auth("bob", Some("bob"))
+        .body("new")
+        .send()?;
+    assert_eq!(resp.status(), 201);
+    let resp = client()
+        .get(format!("{base}/dir3/new.txt"))
+        .basic_auth("bob", Some("bob"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+
+    // alice is not mentioned on /dir3
+    let resp = client()
+        .get(format!("{base}/dir3/new.txt"))
+        .basic_auth("alice", Some("alice"))
+        .send()?;
+    assert_eq!(resp.status(), 403);
+
+    // listing: alice sees /dir1 (acl) and /dir2 (native); guest does not see /dir1
+    let resp = client()
+        .get(format!("{base}/?json"))
+        .basic_auth("alice", Some("alice"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    let alice_names = names(&data);
+    assert!(alice_names.contains(&"dir1".to_string()), "{alice_names:?}");
+    assert!(alice_names.contains(&"dir2".to_string()), "{alice_names:?}");
+    assert!(
+        !alice_names.contains(&"dir3".to_string()),
+        "{alice_names:?}"
+    );
+
+    let resp = client().get(format!("{base}/?json")).send()?;
+    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    let guest_names = names(&data);
+    assert!(
+        !guest_names.contains(&"dir1".to_string()),
+        "{guest_names:?}"
+    );
+
+    // the acl deny also keeps the path out of search results
+    let resp = client().get(format!("{base}/?q=test&json")).send()?;
+    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    let guest_search = names(&data);
+    assert!(
+        !guest_search.iter().any(|n| n.starts_with("dir1/")),
+        "{guest_search:?}"
+    );
+
+    // the listing exposes the user acl summary; x users are marked with *
+    let resp = client()
+        .get(format!("{base}/?json"))
+        .basic_auth("admin", Some("admin"))
+        .send()?;
+    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    let dir1 = data["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "dir1")
+        .unwrap();
+    assert!(
+        dir1["allow_read"].as_str().unwrap().contains("alice"),
+        "{dir1}"
+    );
+    assert!(
+        !dir1["allow_read"].as_str().unwrap().contains("admin*"),
+        "{dir1}"
+    );
+    assert!(
+        dir1["allow_write"].as_str().unwrap().contains("admin*"),
+        "{dir1}"
+    );
+
+    // the combined acl api reports the effective lists
+    let resp = client()
+        .get(format!("{base}/__dufs__/acl?path=/dir1"))
+        .basic_auth("admin", Some("admin"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert_eq!(data["allow_read"], serde_json::json!(["alice"]));
+    assert_eq!(data["deny_read"], serde_json::json!(["guest"]));
+    assert!(data["ips"].is_null());
+    assert_eq!(data["x_users"], serde_json::json!(["admin"]));
+    let version = data["version"].as_str().unwrap().to_string();
+
+    let acl_url = format!("{base}/__dufs__/acl?path=/dir1");
+    let put = |body: serde_json::Value| -> Result<reqwest::blocking::Response, Error> {
+        Ok(client()
+            .put(&acl_url)
+            .basic_auth("admin", Some("admin"))
+            .header("content-type", "application/json")
+            .body(serde_json::to_string(&body)?)
+            .send()?)
+    };
+
+    // stale version is rejected
+    let resp = put(serde_json::json!({ "version": "stale" }))?;
+    assert_eq!(resp.status(), 409);
+
+    // allow and deny may not contain the same user
+    let resp = put(serde_json::json!({
+        "version": version.clone(),
+        "allow_read": ["alice"],
+        "deny_read": ["alice"],
+    }))?;
+    assert_eq!(resp.status(), 400);
+
+    // x users always win and may not be denied
+    let resp = put(serde_json::json!({
+        "version": version.clone(),
+        "deny_read": ["admin"],
+    }))?;
+    assert_eq!(resp.status(), 400);
+
+    // allow_write auto-completes allow_read
+    let resp = put(serde_json::json!({
+        "version": version,
+        "allow_write": ["carol"],
+    }))?;
+    assert_eq!(resp.status(), 204);
+    let resp = client()
+        .get(&acl_url)
+        .basic_auth("admin", Some("admin"))
+        .send()?;
+    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert!(data["allow_read"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "carol"));
+    assert_eq!(data["allow_write"], serde_json::json!(["carol"]));
+
+    // removing the rule falls back to --auth
+    let resp = client()
+        .delete(format!("{base}/__dufs__/acl?path=/dir1"))
+        .basic_auth("admin", Some("admin"))
+        .send()?;
+    assert_eq!(resp.status(), 204);
+    let resp = client()
+        .get(format!("{base}/dir1/test.txt"))
+        .basic_auth("alice", Some("alice"))
+        .send()?;
+    assert_eq!(resp.status(), 403);
+
+    child.kill()?;
+    Ok(())
+}
+#[rstest]
+fn acl_api_and_login_challenge(tmpdir: TempDir, port: Port) -> Result<(), Error> {
+    let mut child = start_acl(&tmpdir, &port, "guest:guest@/:ro")?;
+    wait_for_port(&port);
+    let base = format!("http://localhost:{port}");
+    let client = client();
+    let acl = format!("{base}/__dufs__/acl?path=/");
+
+    // unauthenticated guest: challenge, not 403
+    let resp = client.get(&acl).send()?;
+    assert_eq!(resp.status(), 401);
+
+    // basic and digest admin both work
+    let resp = client.get(&acl).basic_auth("admin", Some("admin")).send()?;
+    assert_eq!(resp.status(), 200);
+    let resp = send_with_digest_auth(client.get(&acl), "admin", "admin")?;
+    assert_eq!(resp.status(), 200);
+
+    // the login button forces a fresh challenge for the guest identity
+    let resp = client.get(format!("{base}/?login")).send()?;
+    assert_eq!(resp.status(), 401);
+    let resp = client
+        .get(format!("{base}/?login"))
+        .basic_auth("guest", Some("guest"))
+        .send()?;
+    assert_eq!(resp.status(), 401);
+    // a successful login drops the marker and returns to the page itself
+    let resp = client
+        .get(format!("{base}/?login"))
+        .basic_auth("admin", Some("admin"))
+        .send()?;
+    assert_eq!(resp.status(), 302);
+    assert_eq!(
+        resp.headers().get("location").unwrap().to_str().unwrap(),
+        "/"
+    );
+
+    // a subdirectory login returns to that directory
+    let resp = client
+        .get(format!("{base}/dir1/?login"))
+        .basic_auth("admin", Some("admin"))
+        .send()?;
+    assert_eq!(resp.status(), 302);
+    assert_eq!(
+        resp.headers().get("location").unwrap().to_str().unwrap(),
+        "/dir1/"
+    );
+
+    child.kill()?;
+    Ok(())
+}
+
+#[rstest]
+fn guest_without_auth_paths_is_acl_only(tmpdir: TempDir, port: Port) -> Result<(), Error> {
+    // a dummy child path gives the guest an index-only root instead of root read
+    let mut child = start_acl(&tmpdir, &port, "guest:guest@/.dufs")?;
+    wait_for_port(&port);
+    let base = format!("http://localhost:{port}");
+    let client = client();
+    let resp = client
+        .put(format!("{base}/__dufs__/acl?path=/dir1"))
+        .basic_auth("admin", Some("admin"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(
+            &serde_json::json!({ "allow_read": ["guest"] }),
+        )?)
+        .send()?;
+    assert_eq!(resp.status(), 204);
+
+    // the guest only sees what the acl grants, not the root's native files
+    let resp = client.get(format!("{base}/?json")).send()?;
+    assert_eq!(resp.status(), 200);
+    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    let names = names(&data);
+    assert!(names.contains(&"dir1".to_string()), "{names:?}");
+    assert!(!names.contains(&"test.txt".to_string()), "{names:?}");
+
+    let resp = client.get(format!("{base}/test.txt")).send()?;
+    assert!(!resp.status().is_success(), "{}", resp.status());
+    let resp = client.get(format!("{base}/dir1/test.txt")).send()?;
+    assert_eq!(resp.status(), 200);
+
+    child.kill()?;
+    Ok(())
+}
+#[rstest]
+fn acl_api_accepts_digest_writes(tmpdir: TempDir, port: Port) -> Result<(), Error> {
+    let mut child = start_acl(&tmpdir, &port, "guest:guest@/:ro")?;
+    wait_for_port(&port);
+    let base = format!("http://localhost:{port}");
+    let client = client();
+    let acl = format!("{base}/__dufs__/acl?path=/dir1");
+
+    // a digest hash is bound to the real request method: PUT and DELETE must
+    // validate against PUT/DELETE even though the permission check uses GET
+    let resp = send_with_digest_auth(
+        client
+            .put(&acl)
+            .header("content-type", "application/json")
+            .body(serde_json::to_string(
+                &serde_json::json!({ "allow_read": ["guest"] }),
+            )?),
+        "admin",
+        "admin",
+    )?;
+    assert_eq!(resp.status(), 204);
+
+    let resp = send_with_digest_auth(client.delete(&acl), "admin", "admin")?;
+    assert_eq!(resp.status(), 204);
+
+    child.kill()?;
+    Ok(())
+}
+#[rstest]
+fn admin_x_sees_acl_denied_entry(tmpdir: TempDir, port: Port) -> Result<(), Error> {
+    std::fs::create_dir_all(tmpdir.path().join(".dufs"))?;
+    std::fs::write(
+        tmpdir.path().join(".dufs/user-acl.json"),
+        r#"{ "version": 1, "rules": { "/test.txt": { "allow_read": ["bob"] } } }"#,
+    )?;
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("--auth")
+        .arg("guest:guest@/:ro")
+        .arg("--auth")
+        .arg("admin:admin@/:rwx")
+        .stdout(Stdio::null())
+        .spawn()?;
+    wait_for_port(&port);
+    let base = format!("http://localhost:{port}");
+    let client = client();
+
+    // the x admin sees and reads a file whose acl lists only bob
+    let resp = client
+        .get(format!("{base}/?json"))
+        .basic_auth("admin", Some("admin"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert!(names(&data).contains(&"test.txt".to_string()), "{data}");
+    let admin_item = data["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "test.txt")
+        .unwrap();
+    assert_eq!(admin_item["allow_write"], "admin*");
+    assert_eq!(
+        client
+            .get(format!("{base}/test.txt"))
+            .basic_auth("admin", Some("admin"))
+            .send()?
+            .status(),
+        200
+    );
+
+    // the guest is not listed by the managed rule
+    let resp = client.get(format!("{base}/?json")).send()?;
+    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert!(!names(&data).contains(&"test.txt".to_string()), "{data}");
+    assert_eq!(client.get(format!("{base}/test.txt")).send()?.status(), 403);
+    // a viewer without x gets neither the read nor the write list
+    let guest_item = data["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "index.html")
+        .unwrap();
+    assert_eq!(guest_item["allow_read"], "");
+    assert_eq!(guest_item["allow_write"], "");
+
+    child.kill()?;
+    Ok(())
+}
+#[rstest]
+fn admin_x_sees_ip_blocked_entry(tmpdir: TempDir, port: Port) -> Result<(), Error> {
+    std::fs::create_dir_all(tmpdir.path().join(".dufs"))?;
+    std::fs::write(
+        tmpdir.path().join(".dufs/ip-whitelist.json"),
+        r#"{ "version": 1, "rules": { "/test.txt": [] } }"#,
+    )?;
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-A")
+        .arg("--auth")
+        .arg("guest:guest@/:ro")
+        .arg("--auth")
+        .arg("admin:admin@/:rwx")
+        .stdout(Stdio::null())
+        .spawn()?;
+    wait_for_port(&port);
+    let base = format!("http://localhost:{port}");
+    let client = client();
+
+    // the x admin still sees the ip-blocked entry, marked blocked
+    let resp = client
+        .get(format!("{base}/?json"))
+        .basic_auth("admin", Some("admin"))
+        .send()?;
+    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    let item = data["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "test.txt")
+        .expect("the x admin must see the blocked entry");
+    assert_eq!(item["whitelist"], "blocked");
+
+    // the content is still refused by the ip whitelist
+    assert_eq!(
+        client
+            .get(format!("{base}/test.txt"))
+            .basic_auth("admin", Some("admin"))
+            .send()?
+            .status(),
+        403
+    );
+
+    // a guest without x does not see it
+    let resp = client.get(format!("{base}/?json")).send()?;
+    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert!(!names(&data).contains(&"test.txt".to_string()), "{data}");
+
+    child.kill()?;
+    Ok(())
+}
+
+#[rstest]
+fn metadata_dir_is_never_exposed(tmpdir: TempDir, port: Port) -> Result<(), Error> {
+    let mut child = start_acl(&tmpdir, &port, "guest:guest@/:ro")?;
+    wait_for_port(&port);
+    let base = format!("http://localhost:{port}");
+    let client = client();
+
+    // create the store through the management api
+    let resp = client
+        .put(format!("{base}/__dufs__/acl?path=/dir1"))
+        .basic_auth("admin", Some("admin"))
+        .body(r#"{"allow_read":["guest"],"allow_write":[],"deny_read":[]}"#)
+        .send()?;
+    assert_eq!(resp.status(), 204);
+
+    for path in [
+        "/.dufs/user-acl.json",
+        "/.DUFS/user-acl.json",
+        "/.dufs/",
+        "/.dufs",
+    ] {
+        let resp = client
+            .get(format!("{base}{path}"))
+            .basic_auth("admin", Some("admin"))
+            .send()?;
+        assert_eq!(resp.status(), 404, "{path}");
+    }
+
+    // the root archive must not contain the metadata dir
+    let resp = client
+        .get(format!("{base}/?zip"))
+        .basic_auth("admin", Some("admin"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    let bytes = resp.bytes()?;
+    assert!(
+        !bytes.windows(5).any(|w| w == b".dufs"),
+        "archive leaks the metadata dir"
+    );
+
+    let resp = client
+        .get(format!("{base}/.dufs/?zip"))
+        .basic_auth("admin", Some("admin"))
+        .send()?;
+    assert_eq!(resp.status(), 404);
+
+    // a guest whose only auth path is the metadata dir must not archive it
+    child.kill()?;
+    let mut child = start_acl(&tmpdir, &port, "guest:guest@/.dufs")?;
+    wait_for_port(&port);
+    let resp = client
+        .get(format!("{base}/?zip"))
+        .basic_auth("guest", Some("guest"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    let bytes = resp.bytes()?;
+    assert!(
+        !bytes.windows(5).any(|w| w == b".dufs"),
+        "guest archive leaks the metadata dir"
+    );
+
+    child.kill()?;
+    Ok(())
+}

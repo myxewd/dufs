@@ -1,12 +1,13 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::args::AuthType;
-use crate::auth::{www_authenticate, AccessPaths, AccessPerm};
+use crate::auth::{is_readonly_method, www_authenticate, AccessPaths, AccessPerm};
 use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
 use crate::ip_whitelist::{IpNet, IpWhitelist};
 use crate::ip_whitelist_store;
 use crate::noscript::{detect_noscript, generate_noscript_html};
 use crate::oidc::{Oidc, OidcConfig, SESSION_COOKIE};
+use crate::user_acl::{self, AclMember, AclMemberKind, AclPerm, UserAcl, UserRule};
 use crate::utils::{
     decode_uri, encode_uri, get_file_name, glob, join_within, parse_range, try_get_file_name,
 };
@@ -66,6 +67,7 @@ const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
 const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
 const IP_WHITELIST_API_PATH: &str = "__dufs__/ip-whitelist";
+const ACL_API_PATH: &str = "__dufs__/acl";
 const OIDC_PREFIX: &str = "__dufs__/oidc/";
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
 
@@ -75,6 +77,7 @@ pub struct Server {
     html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
     ip_whitelist: RwLock<Arc<IpWhitelist>>,
+    user_acl: RwLock<Arc<UserAcl>>,
     oidc: Option<Oidc>,
     running: Arc<AtomicBool>,
 }
@@ -134,6 +137,12 @@ impl Server {
             Arc::new(args.ip_whitelist.clone())
         };
 
+        let user_acl = if args.path_is_file {
+            Arc::new(UserAcl::default())
+        } else {
+            Arc::new(user_acl::load(&args.serve_path)?)
+        };
+
         let oidc = match args.auth_type {
             AuthType::Oidc => {
                 if !args.auth.has_users() {
@@ -153,6 +162,7 @@ impl Server {
             assets_prefix,
             html,
             ip_whitelist: RwLock::new(ip_whitelist),
+            user_acl: RwLock::new(user_acl),
             oidc,
         })
     }
@@ -213,9 +223,12 @@ impl Server {
             }
         };
 
-        // The metadata directory is never served.
-        if relative_path == ip_whitelist_store::METADATA_DIR
-            || relative_path.starts_with(&format!("{}/", ip_whitelist_store::METADATA_DIR))
+        // The metadata directory is internal: never served, listed, searched
+        // or archived, even for an x user. Match case-insensitively so a
+        // case-insensitive filesystem cannot be used to bypass it.
+        let lower_path = relative_path.to_ascii_lowercase();
+        if lower_path == ip_whitelist_store::METADATA_DIR
+            || lower_path.starts_with(&format!("{}/", ip_whitelist_store::METADATA_DIR))
         {
             status_not_found(&mut res);
             return Ok(res);
@@ -235,11 +248,20 @@ impl Server {
         }
 
         let ip_ok = self.ip_allowed(&relative_path, ip).await;
+        // The ip whitelist is the highest layer: it applies to guests, users and
+        // acl managers alike, including the acl browsing view.
+        if !ip_ok {
+            status_forbid(&mut res);
+            return Ok(res);
+        }
 
         // The management API is guarded by authentication rather than the ip
         // whitelist, so an administrator is never locked out of fixing a rule.
         if relative_path == IP_WHITELIST_API_PATH {
             return self.handle_ip_whitelist(req, method).await;
+        }
+        if relative_path == ACL_API_PATH {
+            return self.handle_acl(req, method).await;
         }
 
         let headers = req.headers();
@@ -275,21 +297,6 @@ impl Server {
             }
         }
 
-        // The top-right Login button navigates to `?login`, which starts the
-        // configured authentication instead of continuing as the guest.
-        if has_query_flag(&query_params, "login") {
-            if self.oidc.is_some() {
-                let next = urlencoding::encode(req_path.as_str());
-                let location = format!("{}__dufs__/oidc/login?next={next}", self.args.uri_prefix);
-                redirect(&mut res, &location);
-                return Ok(res);
-            }
-            if authorization.is_none() && self.args.auth.has_users() {
-                self.auth_reject(&mut res)?;
-                return Ok(res);
-            }
-        }
-
         let (user, access_paths, via_token) = if let Some(oidc) = &self.oidc {
             self.guard_oidc(oidc, headers, &relative_path, &method)
                 .await
@@ -305,6 +312,63 @@ impl Server {
                     &self.args.serve_path,
                 )
                 .await
+        };
+
+        // The top-right Login button navigates to `?login`. Challenge unless a
+        // real user is authenticated, even when the browser still has cached
+        // guest credentials, so the login always starts a fresh authentication.
+        if has_query_flag(&query_params, "login") {
+            if self.oidc.is_some() {
+                let next = urlencoding::encode(req_path.as_str());
+                let location = format!("{}__dufs__/oidc/login?next={next}", self.args.uri_prefix);
+                redirect(&mut res, &location);
+                return Ok(res);
+            }
+            let is_guest = user.as_deref().is_none_or(|user| user == "guest");
+            if self.args.auth.has_users() && is_guest {
+                self.auth_reject(&mut res)?;
+                return Ok(res);
+            }
+            // Authenticated: drop the `?login` marker and return to the
+            // page that started the login (the root for `/?login`).
+            redirect(&mut res, &req_path);
+            return Ok(res);
+        }
+
+        let acl_user = user.as_deref().unwrap_or("guest").to_string();
+        // x is a native permission: it wins over the acl, including deny
+        // rules. x users are still limited by the ip whitelist above.
+        let is_x = access_paths.as_ref().is_some_and(|ap| ap.acl());
+        let access_paths = if is_x {
+            let mut ap = access_paths.unwrap_or_default();
+            ap.set_perm(AccessPerm::ReadWrite);
+            Some(ap)
+        } else {
+            // The acl sits on top of --auth: a listed user gets the listed
+            // level even when --auth does not grant it, and a covered path
+            // defaults to deny for users missing from its rule.
+            let acl = self.acl_perm(&relative_path, &acl_user).await;
+            let method_is_write = !is_readonly_method(&method);
+            if matches!(acl, Some(AclPerm::Deny))
+                || (matches!(acl, Some(AclPerm::Read)) && method_is_write)
+            {
+                status_forbid(&mut res);
+                return Ok(res);
+            }
+            match acl {
+                Some(AclPerm::Read) => {
+                    let mut ap = access_paths.unwrap_or_default();
+                    ap.set_perm(AccessPerm::ReadOnly);
+                    Some(ap)
+                }
+                Some(AclPerm::Write) => {
+                    let mut ap = access_paths.unwrap_or_default();
+                    ap.set_perm(AccessPerm::ReadWrite);
+                    Some(ap)
+                }
+                Some(AclPerm::Deny) => unreachable!(),
+                None => access_paths,
+            }
         };
 
         let (user, access_paths) = match (user, access_paths) {
@@ -335,8 +399,13 @@ impl Server {
             (x, Some(y)) => (x, y),
         };
 
-        let is_manager = self.args.allow_ip_whitelist && access_paths.perm().readwrite();
-        if !ip_ok && !is_manager {
+        // Deleting or renaming also needs write permission on the parent
+        // directory, so a readable-but-unwritable parent cannot be bypassed.
+        if (method == Method::DELETE || method.as_str() == "MOVE")
+            && !self
+                .parent_writable(&relative_path, &acl_user, &method, authorization, headers)
+                .await
+        {
             status_forbid(&mut res);
             return Ok(res);
         }
@@ -455,8 +524,15 @@ impl Server {
                                     .await?;
                                 return Ok(res);
                             }
-                            self.handle_zip_dir(path, head_only, access_paths, ip, &mut res)
-                                .await?;
+                            self.handle_zip_dir(
+                                path,
+                                head_only,
+                                access_paths,
+                                ip,
+                                &acl_user,
+                                &mut res,
+                            )
+                            .await?;
                         } else if allow_search && query_params.contains_key("q") {
                             self.handle_search_dir(
                                 path,
@@ -498,7 +574,7 @@ impl Server {
                             status_not_found(&mut res);
                             return Ok(res);
                         }
-                        self.handle_zip_dir(path, head_only, access_paths, ip, &mut res)
+                        self.handle_zip_dir(path, head_only, access_paths, ip, &acl_user, &mut res)
                             .await?;
                     } else if allow_search && query_params.contains_key("q") {
                         self.handle_search_dir(
@@ -620,8 +696,17 @@ impl Server {
                             } else {
                                 access_paths
                             };
-                        self.handle_propfind_dir(path, headers, access_paths, ip, &mut res)
-                            .await?;
+                        let propfind_is_auth_x = access_paths.acl() && user.is_some();
+                        self.handle_propfind_dir(
+                            path,
+                            headers,
+                            access_paths,
+                            ip,
+                            &acl_user,
+                            propfind_is_auth_x,
+                            &mut res,
+                        )
+                        .await?;
                     } else if is_file {
                         self.handle_propfind_file(path, &mut res).await?;
                     } else {
@@ -752,11 +837,23 @@ impl Server {
         ip: Option<IpAddr>,
         res: &mut Response,
     ) -> Result<()> {
-        let show_all = self.args.allow_ip_whitelist && access_paths.perm().readwrite();
+        let show_all = self.args.allow_ip_whitelist && access_paths.acl();
+        let is_x = access_paths.acl();
+        let is_auth_x = is_x && user.is_some();
+        let acl_user = user.as_deref().unwrap_or("guest").to_string();
         let mut paths = vec![];
         if !head_only && exist {
             paths = match self
-                .list_dir(path, path, access_paths.clone(), ip, show_all)
+                .list_dir(
+                    path,
+                    path,
+                    access_paths.clone(),
+                    ip,
+                    show_all,
+                    is_x,
+                    is_auth_x,
+                    &acl_user,
+                )
                 .await
             {
                 Ok(paths) => paths,
@@ -788,7 +885,8 @@ impl Server {
         ip: Option<IpAddr>,
         res: &mut Response,
     ) -> Result<()> {
-        let show_all = self.args.allow_ip_whitelist && access_paths.perm().readwrite();
+        let is_x = access_paths.acl();
+        let acl_user = user.clone().unwrap_or_else(|| "guest".to_string());
         let mut paths: Vec<PathItem> = vec![];
         let search = query_params
             .get("q")
@@ -818,12 +916,14 @@ impl Server {
                 access_paths.clone(),
                 self.whitelist_snapshot(),
                 ip,
-                show_all,
+                is_x,
                 self.running.clone(),
                 path_buf,
                 hidden,
                 self.args.allow_symlink,
                 self.args.serve_path.clone(),
+                self.user_acl_snapshot(),
+                acl_user.clone(),
                 move |x| get_file_name(x.path()).to_lowercase().contains(&search),
             ))
             .await?;
@@ -852,6 +952,7 @@ impl Server {
         head_only: bool,
         access_paths: AccessPaths,
         ip: Option<IpAddr>,
+        acl_user: &str,
         res: &mut Response,
     ) -> Result<()> {
         let (mut writer, reader) = tokio::io::duplex(BUF_SIZE);
@@ -869,6 +970,9 @@ impl Server {
         let follow_symlinks = self.args.allow_symlink;
         let serve_path = self.args.serve_path.clone();
         let ip_whitelist = self.whitelist_snapshot();
+        let user_acl = self.user_acl_snapshot();
+        let acl_user = acl_user.to_string();
+        let is_x = access_paths.acl();
         tokio::spawn(async move {
             if let Err(e) = zip_dir(
                 &mut writer,
@@ -880,6 +984,9 @@ impl Server {
                 compression,
                 follow_symlinks,
                 serve_path,
+                user_acl,
+                acl_user,
+                is_x,
                 running,
             )
             .await
@@ -1046,6 +1153,18 @@ impl Server {
         headers: &HeaderMap<HeaderValue>,
         res: &mut Response,
     ) -> Result<bool> {
+        // Browsers also probe /favicon.ico directly; serve it without an auth
+        // challenge so an unauthenticated page load never prompts.
+        if req_path == "favicon.ico" {
+            res.headers_mut()
+                .insert("content-type", HeaderValue::from_static("image/x-icon"));
+            res.headers_mut()
+                .typed_insert(ContentLength(FAVICON_ICO.len() as u64));
+            if !head_only {
+                *res.body_mut() = body_full(FAVICON_ICO);
+            }
+            return Ok(true);
+        }
         if let Some(name) = req_path.strip_prefix(&self.assets_prefix) {
             match self.args.assets.as_ref() {
                 Some(assets_path) => {
@@ -1395,9 +1514,12 @@ impl Server {
         headers: &HeaderMap<HeaderValue>,
         access_paths: AccessPaths,
         ip: Option<IpAddr>,
+        acl_user: &str,
+        is_auth_x: bool,
         res: &mut Response,
     ) -> Result<()> {
-        let show_all = self.args.allow_ip_whitelist && access_paths.perm().readwrite();
+        let show_all = self.args.allow_ip_whitelist && access_paths.acl();
+        let is_x = access_paths.acl();
         let depth: u32 = match headers.get("depth") {
             Some(v) => match v.to_str().ok().and_then(|v| v.parse().ok()) {
                 Some(0) => 0,
@@ -1420,7 +1542,16 @@ impl Server {
         };
         if depth == 1 {
             match self
-                .list_dir(path, &self.args.serve_path, access_paths, ip, show_all)
+                .list_dir(
+                    path,
+                    &self.args.serve_path,
+                    access_paths,
+                    ip,
+                    show_all,
+                    is_x,
+                    is_auth_x,
+                    acl_user,
+                )
                 .await
             {
                 Ok(child) => paths.extend(child),
@@ -1639,7 +1770,8 @@ impl Server {
             allow_delete: self.args.allow_delete && readwrite,
             allow_search: self.args.allow_search,
             allow_archive: self.args.allow_archive,
-            allow_ip_whitelist: self.args.allow_ip_whitelist && readwrite,
+            allow_ip_whitelist: self.args.allow_ip_whitelist && access_paths.acl(),
+            has_acl: !self.user_acl_snapshot().is_empty(),
             dir_exists: exist,
             auth: self.args.auth.has_users(),
             auth_type: self.args.auth_type.as_str().to_string(),
@@ -1748,8 +1880,8 @@ impl Server {
                     }
                 };
                 match oidc.complete_login(code, state).await {
-                    Ok((username, next)) => {
-                        let session = oidc.create_session(username);
+                    Ok((username, next, id_token)) => {
+                        let session = oidc.create_session(username, id_token);
                         res.headers_mut()
                             .insert("set-cookie", self.session_cookie(&session));
                         redirect(&mut res, &next);
@@ -1762,12 +1894,23 @@ impl Server {
                 }
             }
             "logout" => {
-                if let Some(session_id) = Oidc::session_id(req.headers()) {
-                    oidc.remove_session(&session_id);
+                let session_id = Oidc::session_id(req.headers());
+                let id_token = session_id
+                    .as_deref()
+                    .and_then(|session_id| oidc.session_id_token(session_id));
+                if let Some(session_id) = &session_id {
+                    oidc.remove_session(session_id);
                 }
                 res.headers_mut()
                     .insert("set-cookie", self.clear_session_cookie());
-                redirect(&mut res, &self.args.uri_prefix);
+                match oidc.end_session_url(id_token.as_deref()).await {
+                    Ok(Some(url)) => redirect(&mut res, &url),
+                    Ok(None) => redirect(&mut res, &self.args.uri_prefix),
+                    Err(err) => {
+                        error!("OIDC end-session failed, {err}");
+                        redirect(&mut res, &self.args.uri_prefix);
+                    }
+                }
             }
             _ => status_not_found(&mut res),
         }
@@ -1971,6 +2114,74 @@ impl Server {
             .clone()
     }
 
+    fn user_acl_snapshot(&self) -> Arc<UserAcl> {
+        self.user_acl
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// A content hash of both acl stores, used for optimistic concurrency.
+    fn acl_version(&self) -> String {
+        let acl = self.user_acl_snapshot();
+        let ips = self.whitelist_snapshot();
+        let data = serde_json::json!({
+            "acl": acl.rules(),
+            "ips": ips.rules(),
+        });
+        let bytes = serde_json::to_vec(&data).unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        hex::encode(hasher.finalize())
+    }
+
+    /// The user acl decision for a path relative to the serve root.
+    async fn acl_perm(&self, path: &str, user: &str) -> Option<AclPerm> {
+        self.user_acl_snapshot()
+            .perm(path, user, Some(&self.args.serve_path))
+            .await
+    }
+
+    /// Whether the user may write the parent directory of a path. This backs
+    /// the per-operation rule for DELETE and MOVE (parent w + target r).
+    async fn parent_writable(
+        &self,
+        path: &str,
+        acl_user: &str,
+        auth_method: &Method,
+        authorization: Option<&HeaderValue>,
+        headers: &HeaderMap<HeaderValue>,
+    ) -> bool {
+        let parent = path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or("");
+        let (_, parent_paths, _) = if let Some(oidc) = &self.oidc {
+            self.guard_oidc(oidc, headers, parent, &Method::GET).await
+        } else {
+            self.args
+                .auth
+                .guard_with_auth_method(
+                    parent,
+                    &Method::GET,
+                    auth_method,
+                    authorization,
+                    None,
+                    false,
+                    &self.args.serve_path,
+                )
+                .await
+        };
+        if parent_paths.as_ref().is_some_and(|v| v.acl()) {
+            return true;
+        }
+        match self.acl_perm(parent, acl_user).await {
+            Some(AclPerm::Write) => true,
+            Some(_) => false,
+            None => parent_paths.as_ref().is_some_and(|v| v.perm().readwrite()),
+        }
+    }
+
     /// Whether the client address may access a path relative to the serve root.
     async fn ip_allowed(&self, path: &str, ip: Option<IpAddr>) -> bool {
         self.whitelist_snapshot()
@@ -2020,13 +2231,15 @@ impl Server {
             return Ok(res);
         }
 
-        let (_, access_paths, _) = if let Some(oidc) = &self.oidc {
-            self.guard_oidc(oidc, req.headers(), "/", &method).await
+        let (user, access_paths, _) = if let Some(oidc) = &self.oidc {
+            self.guard_oidc(oidc, req.headers(), "/", &Method::GET)
+                .await
         } else {
             self.args
                 .auth
-                .guard(
+                .guard_with_auth_method(
                     "/",
+                    &Method::GET,
                     &method,
                     req.headers().get(AUTHORIZATION),
                     None,
@@ -2042,8 +2255,14 @@ impl Server {
                 return Ok(res);
             }
         };
-        if !access_paths.perm().readwrite() {
-            status_forbid(&mut res);
+        if !access_paths.acl() {
+            // A guest there is no x: challenge for a real user instead of
+            // returning 403, which would stop the browser from prompting.
+            if user.is_none() && self.args.auth.has_users() {
+                self.auth_reject(&mut res)?;
+            } else {
+                status_forbid(&mut res);
+            }
             return Ok(res);
         }
 
@@ -2129,6 +2348,265 @@ impl Server {
         Ok(res)
     }
 
+    /// Combined read/write/deny-read acl for one path, editable from the WebUI.
+    async fn handle_acl(&self, req: Request, method: Method) -> Result<Response> {
+        let mut res = Response::default();
+
+        if self.args.path_is_file || !self.args.allow_ip_whitelist {
+            status_forbid(&mut res);
+            return Ok(res);
+        }
+
+        let query_params: HashMap<String, String> =
+            form_urlencoded::parse(req.uri().query().unwrap_or_default().as_bytes())
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let target = query_params
+            .get("path")
+            .cloned()
+            .unwrap_or_else(|| "/".to_string());
+
+        let (user, access_paths, _) = if let Some(oidc) = &self.oidc {
+            self.guard_oidc(oidc, req.headers(), &target, &Method::GET)
+                .await
+        } else {
+            self.args
+                .auth
+                .guard_with_auth_method(
+                    &target,
+                    &Method::GET,
+                    &method,
+                    req.headers().get(AUTHORIZATION),
+                    None,
+                    false,
+                    &self.args.serve_path,
+                )
+                .await
+        };
+        let access_paths = match access_paths {
+            Some(v) => v,
+            None => {
+                self.auth_reject(&mut res)?;
+                return Ok(res);
+            }
+        };
+        // Only the x permission may read or change the acl.
+        if !access_paths.acl() {
+            // A guest there is no x: challenge for a real user instead of
+            // returning 403, which would stop the browser from prompting.
+            if user.is_none() && self.args.auth.has_users() {
+                self.auth_reject(&mut res)?;
+            } else {
+                status_forbid(&mut res);
+            }
+            return Ok(res);
+        }
+
+        match method {
+            Method::GET | Method::HEAD => {
+                let ips = self
+                    .whitelist_snapshot()
+                    .find(&target, Some(&self.args.serve_path))
+                    .await
+                    .map(|v| v.iter().map(|v| v.to_string()).collect::<Vec<_>>());
+                let eff = self
+                    .user_acl_snapshot()
+                    .effective(&target, Some(&self.args.serve_path))
+                    .await;
+                let x_users = self.args.auth.x_users(&target, &self.args.serve_path).await;
+                let chain = self
+                    .user_acl_snapshot()
+                    .chain(&target, Some(&self.args.serve_path))
+                    .await;
+                let own = self
+                    .user_acl_snapshot()
+                    .own(&target, Some(&self.args.serve_path))
+                    .await;
+                let inherited = self
+                    .user_acl_snapshot()
+                    .inherited(&target, Some(&self.args.serve_path))
+                    .await;
+                let data = serde_json::json!({
+                    "path": target,
+                    "ips": ips,
+                    "allow_read": eff.allow_read,
+                    "allow_write": eff.allow_write,
+                    "deny_read": eff.deny_read,
+                    "version": self.acl_version(),
+                    "x_users": x_users,
+                    "chain": chain,
+                    "own": own,
+                    "inherited": inherited,
+                });
+                let body = serde_json::to_string_pretty(&data)?;
+                res.headers_mut()
+                    .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
+                res.headers_mut()
+                    .typed_insert(ContentLength(body.len() as u64));
+                if method == Method::GET {
+                    *res.body_mut() = body_full(body);
+                }
+            }
+            Method::PUT | Method::POST => {
+                let bytes = req
+                    .into_body()
+                    .collect()
+                    .await
+                    .map_err(|err| anyhow!("Failed to read request body, {err}"))?
+                    .to_bytes();
+                #[derive(serde::Deserialize)]
+                struct AclPayload {
+                    #[serde(default)]
+                    version: Option<String>,
+                    #[serde(default)]
+                    ips: Option<Vec<String>>,
+                    #[serde(default)]
+                    allow_read: Option<Vec<String>>,
+                    #[serde(default)]
+                    allow_write: Option<Vec<String>>,
+                    #[serde(default)]
+                    deny_read: Option<Vec<String>>,
+                }
+                let payload: AclPayload = match serde_json::from_slice(&bytes) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        status_bad_request(&mut res, &format!("Invalid JSON, {err}"));
+                        return Ok(res);
+                    }
+                };
+                if let Some(version) = &payload.version {
+                    if version != &self.acl_version() {
+                        *res.status_mut() = StatusCode::CONFLICT;
+                        *res.body_mut() = body_full("ACL has been modified, reload and try again");
+                        return Ok(res);
+                    }
+                }
+                let clean = |v: Option<Vec<String>>| {
+                    v.map(|list| {
+                        let mut out: Vec<String> = vec![];
+                        for item in list {
+                            let item = item.trim().to_string();
+                            if item.is_empty() || out.contains(&item) {
+                                continue;
+                            }
+                            out.push(item);
+                        }
+                        out
+                    })
+                };
+                let mut allow_read = clean(payload.allow_read);
+                let allow_write = clean(payload.allow_write);
+                let deny_read = clean(payload.deny_read);
+                // write implies read: keep allow_read complete
+                if let Some(write) = &allow_write {
+                    let read = allow_read.get_or_insert_with(Vec::new);
+                    for user in write {
+                        if !read.contains(user) {
+                            read.push(user.clone());
+                        }
+                    }
+                }
+                // a user may not be both allowed and denied
+                if let Some(user) = deny_read
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|user| {
+                        allow_read.iter().flatten().any(|u| u == *user)
+                            || allow_write.iter().flatten().any(|u| u == *user)
+                    })
+                {
+                    status_bad_request(
+                        &mut res,
+                        &format!("user '{user}' appears in both allow and deny"),
+                    );
+                    return Ok(res);
+                }
+                // x users always win over the acl, so they must not be denied
+                let x_users = self.args.auth.x_users(&target, &self.args.serve_path).await;
+                if let Some(user) = deny_read
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|user| x_users.contains(user))
+                {
+                    status_bad_request(
+                        &mut res,
+                        &format!("user '{user}' has x and cannot be denied"),
+                    );
+                    return Ok(res);
+                }
+
+                let mut new_whitelist = (*self.whitelist_snapshot()).clone();
+                if let Some(ips) = payload.ips {
+                    if let Err(err) = new_whitelist.insert_ips(&target, &ips) {
+                        status_bad_request(&mut res, &err.to_string());
+                        return Ok(res);
+                    }
+                }
+                let mut new_acl = (*self.user_acl_snapshot()).clone();
+                new_acl.insert(
+                    &target,
+                    UserRule {
+                        allow_read,
+                        allow_write,
+                        deny_read,
+                    },
+                );
+                if let Err(err) = ip_whitelist_store::save(&self.args.serve_path, &new_whitelist) {
+                    error!("Failed to save acl, {err}");
+                    *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    *res.body_mut() = body_full(format!("Failed to save acl, {err}"));
+                    return Ok(res);
+                }
+                if let Err(err) = user_acl::save(&self.args.serve_path, &new_acl) {
+                    error!("Failed to save acl, {err}");
+                    *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    *res.body_mut() = body_full(format!("Failed to save acl, {err}"));
+                    return Ok(res);
+                }
+                *self.ip_whitelist.write().unwrap_or_else(|e| e.into_inner()) =
+                    Arc::new(new_whitelist);
+                *self.user_acl.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(new_acl);
+                *res.status_mut() = StatusCode::NO_CONTENT;
+            }
+            Method::DELETE => {
+                if let Some(version) = query_params.get("version") {
+                    if version != &self.acl_version() {
+                        *res.status_mut() = StatusCode::CONFLICT;
+                        *res.body_mut() = body_full("ACL has been modified, reload and try again");
+                        return Ok(res);
+                    }
+                }
+                let mut new_whitelist = (*self.whitelist_snapshot()).clone();
+                new_whitelist.remove(&target);
+                let mut new_acl = (*self.user_acl_snapshot()).clone();
+                new_acl.remove(&target);
+                if let Err(err) = ip_whitelist_store::save(&self.args.serve_path, &new_whitelist) {
+                    error!("Failed to save acl, {err}");
+                    *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    *res.body_mut() = body_full(format!("Failed to save acl, {err}"));
+                    return Ok(res);
+                }
+                if let Err(err) = user_acl::save(&self.args.serve_path, &new_acl) {
+                    error!("Failed to save acl, {err}");
+                    *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    *res.body_mut() = body_full(format!("Failed to save acl, {err}"));
+                    return Ok(res);
+                }
+                *self.ip_whitelist.write().unwrap_or_else(|e| e.into_inner()) =
+                    Arc::new(new_whitelist);
+                *self.user_acl.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(new_acl);
+                *res.status_mut() = StatusCode::NO_CONTENT;
+            }
+            _ => {
+                *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+            }
+        }
+
+        Ok(res)
+    }
+
     async fn list_dir(
         &self,
         entry_path: &Path,
@@ -2136,21 +2614,26 @@ impl Server {
         access_paths: AccessPaths,
         ip: Option<IpAddr>,
         show_all: bool,
+        is_x: bool,
+        is_auth_x: bool,
+        acl_user: &str,
     ) -> Result<Vec<PathItem>> {
         let mut paths: Vec<PathItem> = vec![];
-        if access_paths.perm().indexonly() {
-            for name in access_paths.child_names() {
-                let entry_path = entry_path.join(name);
-                self.add_pathitem(&mut paths, base_path, &entry_path, ip, show_all)
-                    .await;
-            }
-        } else {
-            let mut rd = fs::read_dir(entry_path).await?;
-            while let Ok(Some(entry)) = rd.next_entry().await {
-                let entry_path = entry.path();
-                self.add_pathitem(&mut paths, base_path, &entry_path, ip, show_all)
-                    .await;
-            }
+        let mut rd = fs::read_dir(entry_path).await?;
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let entry_path = entry.path();
+            self.add_pathitem(
+                &mut paths,
+                base_path,
+                &entry_path,
+                ip,
+                show_all,
+                is_x,
+                is_auth_x,
+                &access_paths,
+                acl_user,
+            )
+            .await;
         }
         Ok(paths)
     }
@@ -2162,17 +2645,60 @@ impl Server {
         entry_path: &Path,
         ip: Option<IpAddr>,
         show_all: bool,
+        is_x: bool,
+        is_auth_x: bool,
+        access_paths: &AccessPaths,
+        acl_user: &str,
     ) {
-        if !show_all && !self.entry_ip_allowed(entry_path, ip).await {
+        // An x user sees ip-blocked entries so they can fix the rule; the
+        // content itself is still refused by the ip check in handle().
+        if !is_auth_x && !self.entry_ip_allowed(entry_path, ip).await {
             return;
         }
+        let rel_path = entry_path
+            .strip_prefix(&self.args.serve_path)
+            .map(normalize_path)
+            .unwrap_or_default();
+        if !is_x {
+            let acl = self.acl_perm(&rel_path, acl_user).await;
+            let native = access_paths
+                .find(get_file_name(entry_path), Some(&self.args.serve_path))
+                .await
+                .is_some();
+            let allowed = match acl {
+                Some(AclPerm::Deny) => false,
+                Some(AclPerm::Read | AclPerm::Write) => true,
+                None => native,
+            };
+            if !allowed {
+                return;
+            }
+        }
         let base_name = get_file_name(entry_path);
+        if base_name.eq_ignore_ascii_case(ip_whitelist_store::METADATA_DIR) {
+            return;
+        }
         if let Ok(Some(mut item)) = self.to_pathitem(entry_path, base_path).await {
             if is_hidden(&self.args.hidden, base_name, item.is_dir()) {
                 return;
             }
             if show_all {
                 item.whitelist = self.whitelist_label(entry_path).await;
+            }
+            // The acl summary is only shown to x users: a viewer without x
+            // on the directory learns neither the read nor the write list.
+            if is_x {
+                let x_users = self
+                    .args
+                    .auth
+                    .x_users(&rel_path, &self.args.serve_path)
+                    .await;
+                let summary = self
+                    .user_acl_snapshot()
+                    .summary(&rel_path, &x_users, Some(&self.args.serve_path))
+                    .await;
+                item.allow_read = format_acl_members(&summary.allow_read);
+                item.allow_write = format_acl_members(&summary.allow_write);
             }
             paths.push(item);
         }
@@ -2232,6 +2758,8 @@ impl Server {
             mtime,
             size,
             whitelist: String::new(),
+            allow_read: String::new(),
+            allow_write: String::new(),
         }))
     }
 }
@@ -2253,6 +2781,7 @@ pub struct IndexData {
     pub allow_search: bool,
     pub allow_archive: bool,
     pub allow_ip_whitelist: bool,
+    pub has_acl: bool,
     pub dir_exists: bool,
     pub auth: bool,
     pub auth_type: String,
@@ -2269,6 +2798,10 @@ pub struct PathItem {
     /// Effective ip whitelist shown to managers: empty means allow all,
     /// `blocked` means nobody may access it.
     pub whitelist: String,
+    /// User acl summary: `alice`, `(peter)` for partial, `[tom]` for an
+    /// exception allow and `alice*` for an x user.
+    pub allow_read: String,
+    pub allow_write: String,
 }
 
 impl PathItem {
@@ -2458,6 +2991,9 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
     compression: CompressionLevel,
     follow_symlinks: bool,
     serve_path: PathBuf,
+    user_acl: Arc<UserAcl>,
+    acl_user: String,
+    is_x: bool,
     running: Arc<AtomicBool>,
 ) -> Result<()> {
     let hidden = Arc::new(hidden.to_vec());
@@ -2465,12 +3001,14 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
         access_paths,
         ip_whitelist,
         ip,
-        false,
+        is_x,
         running,
         dir.to_path_buf(),
         hidden,
         follow_symlinks,
         serve_path,
+        user_acl,
+        acl_user,
         move |x| x.path().symlink_metadata().is_ok() && x.file_type().is_file(),
     ))
     .await?;
@@ -2555,6 +3093,26 @@ fn set_content_disposition(res: &mut Response, inline: bool, filename: &str) -> 
 
 /// Render an effective whitelist for the WebUI. An allow-all range (0.0.0.0/0
 /// or ::/0) and an unrestricted path render as empty; an empty list is blocked.
+fn format_acl_members(members: &[AclMember]) -> String {
+    members
+        .iter()
+        .map(|member| {
+            let name = member.user.clone();
+            let name = if member.is_x {
+                format!("{name}*")
+            } else {
+                name
+            };
+            match member.kind {
+                AclMemberKind::Full => name,
+                AclMemberKind::Partial => format!("({name})"),
+                AclMemberKind::Exception => format!("[{name}]"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn format_ip_whitelist(ips: &[IpNet]) -> String {
     if ips.iter().any(|v| v.is_allow_all()) {
         return String::new();
@@ -2661,19 +3219,37 @@ async fn collect_dir_entries<F>(
     access_paths: AccessPaths,
     ip_whitelist: Arc<IpWhitelist>,
     ip: Option<IpAddr>,
-    bypass_ip: bool,
+    is_x: bool,
     running: Arc<AtomicBool>,
     path: PathBuf,
     hidden: Arc<Vec<String>>,
     follow_symlinks: bool,
     serve_path: PathBuf,
+    user_acl: Arc<UserAcl>,
+    acl_user: String,
     include_entry: F,
 ) -> Vec<PathBuf>
 where
     F: Fn(&DirEntry) -> bool,
 {
     let mut paths: Vec<PathBuf> = vec![];
-    for dir in access_paths.entry_paths(&path) {
+    // Walk the requested directory itself as well: its visible entries may
+    // come from acl rules rather than from the native --auth tree.
+    let mut roots = access_paths.entry_paths(&path);
+    if !roots.iter().any(|v| v == &path) {
+        roots.push(path.clone());
+    }
+    for dir in roots {
+        // An --auth rule may point at the metadata dir directly (for example
+        // `guest:guest@/.dufs`); never walk into it from an archive or search.
+        let rel = dir.strip_prefix(&serve_path).unwrap_or(dir.as_path());
+        if rel.components().any(|c| {
+            c.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(ip_whitelist_store::METADATA_DIR)
+        }) {
+            continue;
+        }
         let mut it = WalkDir::new(&dir).follow_links(true).into_iter();
         it.next();
         while let Some(entry) = it.next() {
@@ -2687,11 +3263,40 @@ where
             let entry_path = entry.path();
             let base_name = get_file_name(entry_path);
             let is_dir = entry.file_type().is_dir();
+            if base_name.eq_ignore_ascii_case(ip_whitelist_store::METADATA_DIR) {
+                if is_dir {
+                    it.skip_current_dir();
+                }
+                continue;
+            }
             if is_hidden(&hidden, base_name, is_dir) {
                 if is_dir {
                     it.skip_current_dir();
                 }
                 continue;
+            }
+
+            if !is_x {
+                let rel_path = entry_path
+                    .strip_prefix(&serve_path)
+                    .map(normalize_path)
+                    .unwrap_or_default();
+                let acl = user_acl.perm(&rel_path, &acl_user, Some(&serve_path)).await;
+                let native = access_paths
+                    .find(&rel_path, Some(&serve_path))
+                    .await
+                    .is_some();
+                let allowed = match acl {
+                    Some(AclPerm::Deny) => false,
+                    Some(AclPerm::Read | AclPerm::Write) => true,
+                    None => native,
+                };
+                if !allowed {
+                    if is_dir {
+                        it.skip_current_dir();
+                    }
+                    continue;
+                }
             }
 
             if !follow_symlinks
@@ -2725,7 +3330,7 @@ where
                 .strip_prefix(&serve_path)
                 .map(normalize_path)
                 .unwrap_or_default();
-            if !bypass_ip && !ip_whitelist.allows(&rel_path, ip, Some(&serve_path)).await {
+            if !ip_whitelist.allows(&rel_path, ip, Some(&serve_path)).await {
                 continue;
             }
             if !include_entry(&entry) {
@@ -2734,5 +3339,37 @@ where
             paths.push(entry_path.to_path_buf());
         }
     }
+    // Several roots may overlap; report each entry once.
+    paths.sort();
+    paths.dedup();
     paths
+}
+#[cfg(test)]
+mod acl_tests {
+    use super::*;
+
+    #[test]
+    fn test_format_acl_members() {
+        let member = |user: &str, kind, is_x| AclMember {
+            user: user.to_string(),
+            kind,
+            is_x,
+        };
+        assert_eq!(
+            format_acl_members(&[member("guest", AclMemberKind::Full, false)]),
+            "guest"
+        );
+        assert_eq!(
+            format_acl_members(&[member("admin", AclMemberKind::Full, true)]),
+            "admin*"
+        );
+        assert_eq!(
+            format_acl_members(&[member("peter", AclMemberKind::Partial, false)]),
+            "(peter)"
+        );
+        assert_eq!(
+            format_acl_members(&[member("tom", AclMemberKind::Exception, false)]),
+            "[tom]"
+        );
+    }
 }

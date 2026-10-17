@@ -84,7 +84,6 @@
       <input type="submit" hidden />
     </form>
     <div class="toolbox-right">
-      <span class="guest-name hidden">guest</span>
       <div class="login-btn hidden" title="Login">
         <svg width="16" height="16" viewBox="0 0 16 16">
           <path fill-rule="evenodd"
@@ -138,20 +137,63 @@
     </div>
   </div>
   <div class="modal hidden" id="whitelistModal">
-    <div class="modal-content">
+    <div class="modal-content acl-modal">
       <div class="modal-head">
-        <b>IP whitelist</b>
+        <b>ACL</b>
         <span class="modal-close" title="Close">&times;</span>
       </div>
       <div class="modal-body">
         <div class="whitelist-path"></div>
-        <input class="whitelist-input" spellcheck="false" autocomplete="off"
+        <div class="acl-tabs">
+          <button class="acl-tab active" data-list="allow_read" type="button">Read</button>
+          <button class="acl-tab" data-list="allow_write" type="button">Write</button>
+          <button class="acl-tab" data-list="deny_read" type="button">Deny Read</button>
+        </div>
+        <div class="acl-panel" data-panel="allow_read">
+          <div class="acl-tags" data-list="allow_read"></div>
+        </div>
+        <div class="acl-panel hidden" data-panel="allow_write">
+          <div class="acl-tags" data-list="allow_write"></div>
+        </div>
+        <div class="acl-panel hidden" data-panel="deny_read">
+          <div class="acl-tags" data-list="deny_read"></div>
+        </div>
+        <label class="whitelist-label" for="aclIpInput">IP whitelist</label>
+        <input id="aclIpInput" class="whitelist-input" spellcheck="false" autocomplete="off"
           placeholder="127.0.0.1, 10.0.0.0/8">
+        <div class="whitelist-hint">Leave empty to block every address; use 0.0.0.0/0 to allow all.</div>
       </div>
       <div class="modal-foot">
         <button class="btn remove-rule-btn" type="button">Remove rule</button>
         <span class="modal-status"></span>
-        <button class="btn save-rule-btn" type="button">Save</button>
+        <button class="btn btn-primary save-rule-btn" type="button">Save</button>
+      </div>
+    </div>
+  </div>
+  <div class="modal hidden" id="aclDiffModal">
+    <div class="modal-content">
+      <div class="modal-head">
+        <b>Confirm ACL changes</b>
+        <span class="modal-close" title="Close">&times;</span>
+      </div>
+      <div class="modal-body acl-diff-body"></div>
+      <div class="modal-foot">
+        <button class="btn acl-diff-cancel" type="button">Cancel</button>
+        <span class="modal-status"></span>
+        <button class="btn btn-primary acl-diff-confirm" type="button">Confirm</button>
+      </div>
+    </div>
+  </div>
+  <div class="modal list-details-modal hidden" id="listDetailsModal">
+    <div class="modal-content">
+      <div class="modal-head">
+        <b>Full list</b>
+        <input class="list-details-search" type="text" placeholder="Filter" spellcheck="false"
+          autocomplete="off">
+        <span class="modal-close" title="Close">&times;</span>
+      </div>
+      <div class="modal-body">
+        <div class="list-details-body"></div>
       </div>
     </div>
   </div>

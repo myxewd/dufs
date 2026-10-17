@@ -192,7 +192,7 @@ pub fn build_cli() -> Command {
                 .hide_env(true)
                 .long("allow-ip-whitelist")
                 .action(ArgAction::SetTrue)
-                .help("Allow managing the per-path ip whitelist from the WebUI"),
+                .help("Allow managing the per-path acl from the WebUI; requires the x permission"),
         )
         .arg(
             Arg::new("enable-cors")
