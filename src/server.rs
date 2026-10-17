@@ -217,6 +217,16 @@ impl Server {
             }
         };
 
+        // Expose the address the server actually used for its ip-whitelist
+        // decisions. Behind a proxy this makes a missing or wrong
+        // --trusted-proxy visible immediately: without it every request
+        // silently looks like it came from the proxy itself.
+        if let Some(ip) = client_ip {
+            if let Ok(value) = HeaderValue::from_str(&ip.to_string()) {
+                res.headers_mut().insert("x-client-ip", value);
+            }
+        }
+
         if enable_cors {
             add_cors(&mut res);
         }
@@ -3037,7 +3047,7 @@ fn add_cors(res: &mut Response) {
     );
     res.headers_mut().insert(
         "Access-Control-Expose-Headers",
-        HeaderValue::from_static("Authorization,*"),
+        HeaderValue::from_static("Authorization,*,x-client-ip"),
     );
 }
 
