@@ -387,6 +387,16 @@ impl UserAcl {
         Some(format!("/{}", keys.join("/")))
     }
 
+    /// Whether a rule strictly below `path` grants `user` read or write.
+    /// Used where the acl covers nothing at the path itself (so `--auth`
+    /// decides): a grant below still needs the path as an entry point.
+    pub async fn grants_below(&self, path: &str, user: &str, root: Option<&Path>) -> bool {
+        match self.find_node(path, root).await {
+            Some(node) => descendant_allows(node, user),
+            None => false,
+        }
+    }
+
     /// Whether a rule is configured at or below `path`.
     pub async fn has_rules(&self, path: &str, root: Option<&Path>) -> bool {
         match self.find_node(path, root).await {
@@ -840,6 +850,31 @@ mod tests {
         assert_eq!(acl.rename("/a.txt", "/b.txt", None).await, 1);
         assert_eq!(acl.perm("/b.txt", "dave", None).await, Some(AclPerm::Read));
         assert!(!acl.has_rules("/a.txt", None).await);
+    }
+
+    #[tokio::test]
+    async fn test_grants_below() {
+        let mut acl = UserAcl::default();
+        acl.insert("/data/team/reports", rule(&["alice"], &[], &[]));
+        acl.insert(
+            "/data/team/secret",
+            UserRule {
+                deny_read: Some(list(&["bob"])),
+                ..Default::default()
+            },
+        );
+
+        // the grant below is found through paths no rule mentions
+        assert!(acl.grants_below("/", "alice", None).await);
+        assert!(acl.grants_below("/data", "alice", None).await);
+        assert!(acl.grants_below("/data/team", "alice", None).await);
+        // the granted path itself is not "below"
+        assert!(!acl.grants_below("/data/team/reports", "alice", None).await);
+        // a path that is not on the way to a rule has no grant below
+        assert!(!acl.grants_below("/elsewhere", "alice", None).await);
+        // a deny alone is not a grant
+        assert!(!acl.grants_below("/data/team", "carol", None).await);
+        assert!(!acl.grants_below("/", "carol", None).await);
     }
 
     #[tokio::test]

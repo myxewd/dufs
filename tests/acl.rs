@@ -449,6 +449,96 @@ fn acl_rules_are_dropped_with_the_content(tmpdir: TempDir, port: Port) -> Result
 }
 
 #[rstest]
+fn acl_traverse_works_without_ancestor_rules(tmpdir: TempDir, port: Port) -> Result<(), Error> {
+    // Only the granted path carries a rule: nothing covers / or the
+    // intermediate directories, so --auth refuses them (a user that is not in
+    // the --auth tree, or an index-only root). The grant still has to be
+    // reachable from the file list.
+    std::fs::create_dir_all(tmpdir.path().join(".dufs"))?;
+    std::fs::create_dir_all(tmpdir.path().join("data/team/reports"))?;
+    std::fs::write(tmpdir.path().join("data/team/reports/q3.pdf"), "q3")?;
+    std::fs::write(tmpdir.path().join("data/team/other.txt"), "other")?;
+    std::fs::write(
+        tmpdir.path().join(".dufs/user-acl.json"),
+        r#"{ "version": 1, "rules": { "/data/team/reports": { "allow_read": ["alice"] } } }"#,
+    )?;
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-A")
+        .arg("--auth")
+        // index-only root, like a guest that may only see the landing page
+        .arg("guest:guest@/dir-no-found")
+        .arg("--auth")
+        // a real user with no access path of its own
+        .arg("alice:alice@/dir-no-found")
+        .arg("--auth")
+        .arg("admin:admin@/:rwx")
+        .stdout(Stdio::null())
+        .spawn()?;
+    wait_for_port(&port);
+    let base = format!("http://localhost:{port}");
+    let client = client();
+    let get = |as_user: &str, path: &str| -> Result<reqwest::blocking::Response, Error> {
+        Ok(client
+            .get(format!("{base}{path}"))
+            .basic_auth(as_user, Some(as_user))
+            .send()?)
+    };
+    let names_of = |as_user: &str, path: &str| -> Result<Vec<String>, Error> {
+        let resp = get(as_user, path)?;
+        assert_eq!(resp.status(), 200, "{path}");
+        let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+        Ok(names(&data))
+    };
+
+    // the whole ancestor chain is walkable, step by step
+    assert_eq!(names_of("alice", "/?json")?, vec!["data".to_string()]);
+    assert_eq!(names_of("alice", "/data/?json")?, vec!["team".to_string()]);
+    assert_eq!(
+        names_of("alice", "/data/team/?json")?,
+        vec!["reports".to_string()]
+    );
+    assert_eq!(
+        names_of("alice", "/data/team/reports/?json")?,
+        vec!["q3.pdf".to_string()]
+    );
+    let resp = get("alice", "/data/team/reports/q3.pdf")?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text()?, "q3");
+    // a sibling that is not granted is still hidden and refused
+    assert_eq!(get("alice", "/data/team/other.txt")?.status(), 403);
+
+    // walking never allows writing
+    let resp = client
+        .put(format!("{base}/data/new.txt"))
+        .basic_auth("alice", Some("alice"))
+        .body("x")
+        .send()?;
+    assert_eq!(resp.status(), 403);
+    let resp = client
+        .request(
+            reqwest::Method::from_bytes(b"MKCOL")?,
+            format!("{base}/data/newdir"),
+        )
+        .basic_auth("alice", Some("alice"))
+        .send()?;
+    assert_eq!(resp.status(), 403);
+    // search reaches through the unmanaged ancestors as well
+    let resp = get("alice", "/?q=q3&json")?;
+    assert_eq!(resp.status(), 200);
+    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert_eq!(names(&data), vec!["data/team/reports/q3.pdf".to_string()]);
+
+    // an anonymous visitor is unchanged: the landing page lists nothing
+    assert_eq!(names_of("guest", "/?json")?, Vec::<String>::new());
+
+    child.kill()?;
+    Ok(())
+}
+
+#[rstest]
 fn acl_traverse_with_render_index(tmpdir: TempDir, port: Port) -> Result<(), Error> {
     // /a has an index page the user may not read, but she must still be able to
     // walk to /a/b where she is granted

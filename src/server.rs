@@ -366,6 +366,9 @@ impl Server {
         // x is a native permission: it wins over the acl, including deny
         // rules. x users are still limited by the ip whitelist above.
         let is_x = access_paths.as_ref().is_some_and(|ap| ap.acl());
+        // Whether the request only walks to a granted descendant instead of
+        // reading the path itself (see the acl handling below).
+        let mut traversal = false;
         let access_paths = if is_x {
             let mut ap = access_paths.unwrap_or_default();
             ap.set_perm(AccessPerm::ReadWrite);
@@ -376,8 +379,19 @@ impl Server {
             // defaults to deny for users missing from its rule.
             let acl = self.acl_perm(&relative_path, &acl_user).await;
             let method_is_write = !is_readonly_method(&method);
+            // When the acl covers nothing here the path falls back to --auth.
+            // --auth may refuse it (no rule for this user at all, or an
+            // index-only root) while a rule below still grants something: the
+            // ancestor then has to stay walkable, otherwise the grant has no
+            // entry point in the file list.
+            traversal = acl.is_none()
+                && !access_paths
+                    .as_ref()
+                    .is_some_and(|ap| !ap.perm().indexonly())
+                && self.has_grant_below(&relative_path, &acl_user).await;
             if matches!(acl, Some(AclPerm::Deny))
                 || (matches!(acl, Some(AclPerm::Read | AclPerm::Traverse)) && method_is_write)
+                || (traversal && method_is_write)
             {
                 status_forbid(&mut res);
                 return Ok(res);
@@ -403,8 +417,12 @@ impl Server {
 
         let (user, access_paths) = match (user, access_paths) {
             (None, None) => {
-                let guest = self.args.auth.guest_paths().is_some();
-                if self.oidc.is_some() {
+                if traversal {
+                    // Walk-only paths stay index-only: --auth grants nothing
+                    // here, so no entry below counts as natively readable.
+                    (None, AccessPaths::default())
+                } else if self.oidc.is_some() {
+                    let guest = self.args.auth.guest_paths().is_some();
                     if guest {
                         // The guest identity exists but this path is not granted
                         // to it; the login button is available on allowed pages.
@@ -416,15 +434,20 @@ impl Server {
                         redirect(&mut res, &location);
                     }
                     return Ok(res);
+                } else {
+                    // Builtin auth challenges the request so the browser can
+                    // prompt for credentials, even when a guest identity exists.
+                    self.auth_reject(&mut res)?;
+                    return Ok(res);
                 }
-                // Builtin auth challenges the request so the browser can
-                // prompt for credentials, even when a guest identity exists.
-                self.auth_reject(&mut res)?;
-                return Ok(res);
             }
-            (Some(_), None) => {
-                status_forbid(&mut res);
-                return Ok(res);
+            (Some(user), None) => {
+                if traversal {
+                    (Some(user), AccessPaths::default())
+                } else {
+                    status_forbid(&mut res);
+                    return Ok(res);
+                }
             }
             (x, Some(y)) => (x, y),
         };
@@ -2290,14 +2313,27 @@ impl Server {
         )
     }
 
+    /// Whether a rule below `path` grants `user` something.
+    async fn has_grant_below(&self, path: &str, user: &str) -> bool {
+        self.user_acl_snapshot()
+            .grants_below(path, user, Some(&self.args.serve_path))
+            .await
+    }
+
     /// Whether the user may only walk `path`, i.e. the acl grants something
-    /// below the directory but not the directory itself.
+    /// below the directory but not the directory itself. This also covers a
+    /// directory no rule mentions at all: --auth may refuse it while a rule
+    /// below still has to be reachable.
     async fn dir_traversable(&self, path: &Path, acl_user: &str) -> bool {
         let rel_path = path
             .strip_prefix(&self.args.serve_path)
             .map(normalize_path)
             .unwrap_or_default();
-        self.acl_perm(&rel_path, acl_user).await == Some(AclPerm::Traverse)
+        match self.acl_perm(&rel_path, acl_user).await {
+            Some(AclPerm::Traverse) => true,
+            Some(_) => false,
+            None => self.has_grant_below(&rel_path, acl_user).await,
+        }
     }
 
     /// The user acl decision for a path relative to the serve root.
@@ -2883,7 +2919,9 @@ impl Server {
                 // the same way when the user opens it.
                 Some(AclPerm::Deny) => false,
                 Some(AclPerm::Read | AclPerm::Write | AclPerm::Traverse) => true,
-                None => native,
+                // No rule covers the entry: --auth decides, unless a rule
+                // below it needs this entry as its entry point.
+                None => native || self.has_grant_below(&rel_path, acl_user).await,
             };
             if !allowed {
                 return;
@@ -3507,7 +3545,13 @@ where
                     // archives can reach the entries granted below it.
                     Some(AclPerm::Read | AclPerm::Write) => true,
                     Some(AclPerm::Traverse) => is_dir,
-                    None => native,
+                    None => {
+                        native
+                            || (is_dir
+                                && user_acl
+                                    .grants_below(&rel_path, &acl_user, Some(&serve_path))
+                                    .await)
+                    }
                 };
                 if !allowed {
                     if is_dir {
