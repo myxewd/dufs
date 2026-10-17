@@ -42,7 +42,7 @@ var DIR_EMPTY_NOTE;
  * @property {string} sort
  * @property {string} order
  */
-const PARAMS = Object.fromEntries(new URLSearchParams(window.location.search).entries());
+let PARAMS = Object.fromEntries(new URLSearchParams(window.location.search).entries());
 
 const IFRAME_FORMATS = [
   ".pdf",
@@ -119,6 +119,30 @@ const beforeUnloadHandler = (event) => {
   }
 };
 
+
+// The per-row icons are rendered as <use> references into one hidden sprite:
+// the same markup repeated for every row dominates the generated HTML.
+const ICON_DEFS = {};
+for (const [name, markup] of Object.entries(ICONS)) {
+  const match = /^<svg([^>]*)>([\s\S]*)<\/svg>$/.exec(markup.trim());
+  const attrs = match[1];
+  const attr = (key) => (new RegExp(key + '="([^"]*)"').exec(attrs) || [])[1] || "";
+  ICON_DEFS[name] = { width: attr("width"), height: attr("height"), viewBox: attr("viewBox"), body: match[2] };
+}
+
+const ICON_SPRITE = `<svg aria-hidden="true" style="display:none">${Object.entries(ICON_DEFS)
+  .map(([name, def]) => `<symbol id="i-${name}" viewBox="${def.viewBox}">${def.body}</symbol>`)
+  .join("")}</svg>`;
+
+/**
+ * Render an icon from the sprite.
+ * @param {string} name
+ */
+function iconSvg(name) {
+  const def = ICON_DEFS[name];
+  return `<svg height="${def.height}" viewBox="${def.viewBox}" width="${def.width}"><use href="#i-${name}"/></svg>`;
+}
+
 // Produce table when window loads
 window.addEventListener("DOMContentLoaded", async () => {
   const $indexData = document.getElementById('index-data');
@@ -129,6 +153,8 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   DATA = JSON.parse(decodeBase64($indexData.innerHTML));
   DIR_EMPTY_NOTE = PARAMS.q ? 'No results' : DATA.dir_exists ? 'Empty folder' : 'Folder will be created when a file is uploaded';
+
+  document.body.insertAdjacentHTML("afterbegin", ICON_SPRITE);
 
   await ready();
 });
@@ -146,24 +172,12 @@ async function ready() {
 
   window.addEventListener('beforeunload', beforeUnloadHandler);
 
-  addBreadcrumb(DATA.href, DATA.uri_prefix);
+  // Wire both views once: navigation between them no longer reloads the
+  // document, so either can be shown at any time.
+  await setupIndexPage();
+  setupEditorPage();
 
-  if (DATA.kind === "Index") {
-    document.title = `Index of ${DATA.href} - Dufs`;
-    document.querySelector(".index-page").classList.remove("hidden");
-
-    await setupIndexPage();
-  } else if (DATA.kind === "Edit") {
-    document.title = `Edit ${DATA.href} - Dufs`;
-    document.querySelector(".editor-page").classList.remove("hidden");
-
-    await setupEditorPage();
-  } else if (DATA.kind === "View") {
-    document.title = `View ${DATA.href} - Dufs`;
-    document.querySelector(".editor-page").classList.remove("hidden");
-
-    await setupEditorPage();
-  }
+  await applyPage(DATA, location.href, false);
 }
 
 class Uploader {
@@ -336,6 +350,7 @@ class Uploader {
   }
 
   complete() {
+    invalidateNavCache();
     this.$status.textContent = "✓";
     this.$percent.textContent = formatPercent(100);
     this.$size.textContent = formatUploadSize(this.file.size, this.file.size);
@@ -422,40 +437,20 @@ function addBreadcrumb(href, uri_prefix) {
 }
 
 async function setupIndexPage() {
-  if (DATA.allow_archive) {
-    const $download = document.querySelector(".download");
-    $download.href = baseUrl() + "?zip";
-    $download.title = "Download folder as a .zip file";
-    $download.classList.add("dlwt");
-    $download.classList.remove("hidden");
-  }
-
-  if (DATA.allow_upload) {
-    setupDropzone();
-    setupUploadFile();
-    setupNewFolder();
-    setupNewFile();
-  }
+  // The page is wired once. Visibility and content are re-applied by
+  // renderIndex() on every navigation, so client-side navigation can reuse
+  // these handlers instead of reloading the document.
+  setupDropzone();
+  setupUploadFile();
+  setupNewFolder();
+  setupNewFile();
+  setupSearch();
+  setupIpWhitelist();
+  setupAclDetails();
+  setupClientNav();
 
   if (DATA.auth) {
     await setupAuth();
-  }
-
-  if (DATA.allow_search) {
-    setupSearch();
-  }
-
-  if (DATA.allow_ip_whitelist) {
-    setupIpWhitelist();
-  }
-
-  setupAclDetails();
-
-  renderPathsTableHead();
-  renderPathsTableBody();
-
-  if (DATA.user && DATA.auth_type !== "oidc") {
-    setupDownloadWithToken();
   }
 }
 
@@ -465,6 +460,11 @@ async function setupIndexPage() {
 function hasAclColumn(list) {
   return DATA.has_acl && (DATA.paths || []).some(p => p[list]);
 }
+
+// Computed once per render: hasAclColumn() scans every path, so calling it
+// from addPath() for every row made rendering O(n²).
+let showAclRead = false;
+let showAclWrite = false;
 
 function renderPathsTableHead() {
   const headerItems = [
@@ -501,8 +501,8 @@ function renderPathsTableHead() {
     const icon = `<span>${svg}</span>`
     return `<th class="cell-${item.name}" ${item.props}><a href="?${qs}">${item.text}${icon}</a></th>`
   }).join("\n")}
-      ${hasAclColumn("allow_read") ? `<th class="cell-acl-read">Read</th>` : ""}
-      ${hasAclColumn("allow_write") ? `<th class="cell-acl-write">Write</th>` : ""}
+      ${showAclRead ? `<th class="cell-acl-read">Read</th>` : ""}
+      ${showAclWrite ? `<th class="cell-acl-write">Write</th>` : ""}
       ${DATA.allow_ip_whitelist ? `<th class="cell-whitelist">Whitelist</th>` : ""}
       <th class="cell-actions">Actions</th>
     </tr>
@@ -512,27 +512,291 @@ function renderPathsTableHead() {
 /**
  * Render path table tbody
  */
+// Rows are appended in chunks: a directory with thousands of entries would
+// otherwise block the main thread and make every later repaint (hover,
+// scroll) proportional to the whole listing.
+const ROW_CHUNK = 200;
+let renderedRows = 0;
+
 function renderPathsTableBody() {
-  if (DATA.paths && DATA.paths.length > 0) {
-    const len = DATA.paths.length;
-    if (len > 0) {
-      $pathsTable.classList.remove("hidden");
-    }
-    for (let i = 0; i < len; i++) {
-      addPath(DATA.paths[i], i);
-    }
-  } else {
+  $pathsTableBody.innerHTML = "";
+  renderedRows = 0;
+  if (!DATA.paths || DATA.paths.length === 0) {
     $emptyFolder.textContent = DIR_EMPTY_NOTE;
     $emptyFolder.classList.remove("hidden");
+    return;
+  }
+  $pathsTable.classList.remove("hidden");
+  renderRowChunk();
+  fillViewport();
+}
+
+function renderRowChunk() {
+  const paths = DATA.paths || [];
+  if (renderedRows >= paths.length) return;
+  const end = Math.min(renderedRows + ROW_CHUNK, paths.length);
+  let html = "";
+  for (let i = renderedRows; i < end; i++) {
+    const file = paths[i];
+    if (file) html += pathRowHtml(file, i);
+  }
+  $pathsTableBody.insertAdjacentHTML("beforeend", html);
+  renderedRows = end;
+}
+
+/**
+ * Keep appending while the rendered rows do not fill the viewport yet.
+ */
+function fillViewport() {
+  const paths = DATA.paths || [];
+  while (renderedRows < paths.length && document.documentElement.scrollHeight <= window.innerHeight + 200) {
+    renderRowChunk();
+  }
+}
+
+function loadMoreRows() {
+  const paths = DATA.paths || [];
+  if (renderedRows >= paths.length) return;
+  if (window.innerHeight + window.scrollY < document.documentElement.scrollHeight - 600) return;
+  renderRowChunk();
+  fillViewport();
+}
+
+window.addEventListener("scroll", loadMoreRows, { passive: true });
+window.addEventListener("resize", fillViewport, { passive: true });
+
+
+/**
+ * Render the index page from DATA. Runs on first load and after every
+ * client-side navigation.
+ */
+function renderIndex() {
+  document.title = `Index of ${DATA.href} - Dufs`;
+  DIR_EMPTY_NOTE = PARAMS.q ? 'No results' : DATA.dir_exists ? 'Empty folder' : 'Folder will be created when a file is uploaded';
+
+  applyIndexChrome();
+
+  showAclRead = hasAclColumn("allow_read");
+  showAclWrite = hasAclColumn("allow_write");
+
+  $pathsTableHead.innerHTML = "";
+  $pathsTableBody.innerHTML = "";
+  $pathsTable.classList.add("hidden");
+  $emptyFolder.classList.add("hidden");
+  $emptyFolder.textContent = "";
+
+  renderPathsTableHead();
+  renderPathsTableBody();
+
+  if (DATA.user && DATA.auth_type !== "oidc") {
+    setupDownloadWithToken();
+  }
+}
+
+function toggleControl(selector, visible) {
+  const $el = document.querySelector(selector);
+  if ($el) $el.classList.toggle("hidden", !visible);
+}
+
+/**
+ * Sync the toolbar buttons with the capabilities of the current directory.
+ */
+function applyIndexChrome() {
+  if (DATA.allow_archive) {
+    const $download = document.querySelector(".download");
+    $download.href = baseUrl() + "?zip";
+    $download.title = "Download folder as a .zip file";
+    $download.classList.add("dlwt");
+  }
+  toggleControl(".download", DATA.allow_archive);
+  toggleControl(".move-file", false);
+  toggleControl(".delete-file", false);
+  toggleControl(".save-btn", false);
+  toggleControl(".upload-file", DATA.allow_upload);
+  toggleControl(".new-folder", DATA.allow_upload);
+  toggleControl(".new-file", DATA.allow_upload);
+  toggleControl(".searchbar", DATA.allow_search);
+  toggleControl(".ip-whitelist-btn", DATA.allow_ip_whitelist);
+}
+
+/* ---------------------- client-side navigation ---------------------- */
+
+// Directory links navigate by fetching the next index page and swapping the
+// table in place instead of reloading the document. Reloading costs the
+// browser a commit + first-paint window (~50-100ms) during which hover,
+// cursor and status-bar feedback are all frozen, which reads as a stutter.
+const NAV_CACHE_MAX = 24;
+const NAV_CACHE_TTL = 60000;
+const navCache = new Map();
+let navSeq = 0;
+let prefetchTimer = 0;
+let prefetchUrl = null;
+
+/** Drop hover-prefetched pages after a mutation so they cannot go stale. */
+function invalidateNavCache() {
+  navCache.clear();
+}
+
+function cancelPrefetch() {
+  clearTimeout(prefetchTimer);
+  prefetchTimer = 0;
+  prefetchUrl = null;
+}
+
+/**
+ * Prefetch only once the pointer rests on a link: sweeping the mouse across a
+ * long listing must not fire a request per row.
+ */
+function schedulePrefetch(url) {
+  if (url === prefetchUrl) return;
+  cancelPrefetch();
+  prefetchUrl = url;
+  prefetchTimer = setTimeout(() => {
+    prefetchTimer = 0;
+    if (prefetchUrl === url) fetchIndex(url);
+  }, 80);
+}
+
+// Parameters that are not page requests: downloads, auth round trips and the
+// plain-text fallback. Everything else can be navigated to in place.
+const NON_PAGE_PARAMS = ["zip", "login", "logout", "noscript", "token", "tokengen"];
+
+function navigationShape(data) {
+  // Only the session identity has to stay stable; the page type may change
+  // (index <-> editor) since both views live in the same document.
+  return [data.auth, data.auth_type, data.user].join("|");
+}
+
+/**
+ * Whether a link points at another page of this server that can be swapped in
+ * place: breadcrumb, directory names and the sort headers of the table.
+ * File links, downloads and auth round trips keep the normal navigation.
+ */
+function isIndexNavLink(a) {
+  if (!a || !a.href) return false;
+  if (a.target === "_blank" || a.hasAttribute("download")) return false;
+  if (a.closest(".breadcrumb")) return true;
+  if (a.closest(".paths-table thead")) return true;
+  const $row = a.closest("tr[data-path-index]");
+  if (!$row) return false;
+  const item = DATA.paths && DATA.paths[Number($row.getAttribute("data-path-index"))];
+  return !!item && item.path_type.endsWith("Dir");
+}
+
+function indexNavUrl(a) {
+  const url = new URL(a.href, location.href);
+  if (url.origin !== location.origin) return null;
+  if (url.hash) return null;
+  for (const key of NON_PAGE_PARAMS) {
+    if (url.searchParams.has(key)) return null;
+  }
+  return url.href;
+}
+
+function parsePageData(text) {
+  const doc = new DOMParser().parseFromString(text, "text/html");
+  const $data = doc.getElementById("index-data");
+  if (!$data) return null;
+  try {
+    const data = JSON.parse(decodeBase64($data.innerHTML));
+    return data && (data.kind === "Index" || data.kind === "Edit" || data.kind === "View") ? data : null;
+  } catch {
+    return null;
   }
 }
 
 /**
- * Add pathitem
+ * Fetch a page, reusing a hover-prefetched response while it is fresh.
+ * Resolves to null when the reply is not a page, e.g. a login redirect, an
+ * error or a download.
+ */
+function fetchIndex(url) {
+  const cached = navCache.get(url);
+  if (cached && Date.now() - cached.time < NAV_CACHE_TTL) return cached.promise;
+  const promise = fetch(url, {
+    credentials: "same-origin",
+    headers: { Accept: "text/html" },
+  })
+    .then(res => (res.ok && !res.redirected ? res.text() : null))
+    .then(text => (text ? parsePageData(text) : null))
+    .catch(() => null);
+  if (navCache.size >= NAV_CACHE_MAX) {
+    navCache.delete(navCache.keys().next().value);
+  }
+  navCache.set(url, { promise, time: Date.now() });
+  return promise;
+}
+
+/**
+ * Swap in another page without replacing the document.
+ */
+async function navigateTo(url, push = true) {
+  const seq = ++navSeq;
+  cancelPrefetch();
+  const data = await fetchIndex(url);
+  if (seq !== navSeq) return;
+  if (!data || navigationShape(data) !== navigationShape(DATA)) {
+    // Login state changed: fall back to a real navigation.
+    location.href = url;
+    return;
+  }
+  await applyPage(data, url, push);
+}
+
+/**
+ * Re-fetch and re-render the current page in place, used after a mutation.
+ */
+async function refreshPage() {
+  const url = location.href;
+  invalidateNavCache();
+  await navigateTo(url, false);
+}
+
+function setupClientNav() {
+  history.replaceState({ dufs: true }, "", location.href);
+
+  window.addEventListener("popstate", event => {
+    if (event.state && event.state.dufs) {
+      navigateTo(location.href, false);
+    } else {
+      location.reload();
+    }
+  });
+
+  document.addEventListener("click", event => {
+    if (event.defaultPrevented || event.button !== 0) return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const a = event.target.closest && event.target.closest("a");
+    if (!isIndexNavLink(a)) return;
+    const url = indexNavUrl(a);
+    if (!url) return;
+    event.preventDefault();
+    navigateTo(url);
+  });
+
+  // Prefetch on hover so a click usually has the next page in hand already.
+  document.addEventListener("pointerover", event => {
+    const a = event.target.closest && event.target.closest("a");
+    if (!isIndexNavLink(a)) return;
+    const url = indexNavUrl(a);
+    if (url) schedulePrefetch(url);
+  });
+
+  document.addEventListener("pointerout", event => {
+    const a = event.target.closest && event.target.closest("a");
+    if (!a) return;
+    const to = event.relatedTarget;
+    if (to && to.nodeType && a.contains(to)) return;
+    cancelPrefetch();
+  });
+}
+
+/**
+ * Build the markup of one path row.
  * @param {PathItem} file
  * @param {number} index
  */
-function addPath(file, index) {
+function pathRowHtml(file, index) {
   const encodedName = encodedStr(file.name);
   let url = newUrl(file.name);
   let actionDelete = "";
@@ -547,30 +811,30 @@ function addPath(file, index) {
     if (DATA.allow_archive) {
       actionDownload = `
       <div class="action-btn">
-        <a class="dlwt" href="${url}?zip" title="Download folder as a .zip file" download>${ICONS.download}</a>
+        <a class="dlwt" href="${url}?zip" title="Download folder as a .zip file" download>${iconSvg("download")}</a>
       </div>`;
     }
   } else {
     actionDownload = `
     <div class="action-btn" >
-      <a class="dlwt" href="${url}" title="Download file" download>${ICONS.download}</a>
+      <a class="dlwt" href="${url}" title="Download file" download>${iconSvg("download")}</a>
     </div>`;
   }
   if (DATA.allow_delete) {
     if (DATA.allow_upload) {
-      actionMove = `<div onclick="movePath(${index})" class="action-btn" id="moveBtn${index}" title="Move & Rename">${ICONS.move}</div>`;
+      actionMove = `<div onclick="movePath(${index})" class="action-btn" id="moveBtn${index}" title="Move & Rename">${iconSvg("move")}</div>`;
       if (!isDir) {
-        actionEdit = `<a class="action-btn" title="Edit file" target="_blank" href="${url}?edit">${ICONS.edit}</a>`;
+        actionEdit = `<a class="action-btn" title="Edit file" target="_blank" href="${url}?edit">${iconSvg("edit")}</a>`;
       }
     }
     actionDelete = `
-    <div onclick="deletePath(${index})" class="action-btn" id="deleteBtn${index}" title="Delete">${ICONS.delete}</div>`;
+    <div onclick="deletePath(${index})" class="action-btn" id="deleteBtn${index}" title="Delete">${iconSvg("delete")}</div>`;
   }
   if (!actionEdit && !isDir) {
-    actionView = `<a class="action-btn" title="Open file" target="_blank" href="${url}?view">${ICONS.view}</a>`;
+    actionView = `<a class="action-btn" title="Open file" target="_blank" href="${url}?view">${iconSvg("view")}</a>`;
   }
   if (DATA.allow_ip_whitelist) {
-    actionWhitelist = `<div onclick="manageWhitelist(${index})" class="action-btn" title="IP whitelist">${ICONS.shield}</div>`;
+    actionWhitelist = `<div onclick="manageWhitelist(${index})" class="action-btn" title="IP whitelist">${iconSvg("shield")}</div>`;
   }
   let actionCell = `
   <td class="cell-actions">
@@ -584,8 +848,7 @@ function addPath(file, index) {
 
   let sizeDisplay = isDir ? formatDirSize(file.size) : formatFileSize(file.size).join(" ");
 
-  $pathsTableBody.insertAdjacentHTML("beforeend", `
-<tr id="addPath${index}">
+  return `<tr id="addPath${index}" data-path-index="${index}">
   <td class="path cell-icon">
     ${getPathSvg(file.path_type)}
   </td>
@@ -594,11 +857,11 @@ function addPath(file, index) {
   </td>
   <td class="cell-mtime">${formatMtime(file.mtime)}</td>
   <td class="cell-size">${sizeDisplay}</td>
-  ${hasAclColumn("allow_read") ? `<td class="cell-acl-read">${listCell(file.allow_read)}</td>` : ""}
-  ${hasAclColumn("allow_write") ? `<td class="cell-acl-write">${listCell(file.allow_write)}</td>` : ""}
+  ${showAclRead ? `<td class="cell-acl-read">${listCell(file.allow_read)}</td>` : ""}
+  ${showAclWrite ? `<td class="cell-acl-write">${listCell(file.allow_write)}</td>` : ""}
   ${DATA.allow_ip_whitelist ? `<td class="cell-whitelist">${listCell(file.whitelist)}</td>` : ""}
   ${actionCell}
-</tr>`);
+</tr>`;
 }
 
 function setupDropzone() {
@@ -609,6 +872,7 @@ function setupDropzone() {
     });
   });
   document.addEventListener("drop", async e => {
+    if (DATA.kind !== "Index") return;
     if (!e.dataTransfer.items[0].webkitGetAsEntry) {
       const files = Array.from(e.dataTransfer.files).filter(v => v.size > 0);
       for (const file of files) {
@@ -642,6 +906,10 @@ async function setupAuth() {
 
 function setupDownloadWithToken() {
   document.querySelectorAll("a.dlwt").forEach(link => {
+    // The table is re-rendered on every navigation while toolbar links
+    // survive, so bind each anchor only once.
+    if (link.dataset.dlwtBound) return;
+    link.dataset.dlwtBound = "1";
     link.addEventListener("click", async e => {
       e.preventDefault();
       try {
@@ -669,7 +937,6 @@ function setupDownloadWithToken() {
 
 function setupSearch() {
   const $searchbar = document.querySelector(".searchbar");
-  $searchbar.classList.remove("hidden");
   $searchbar.addEventListener("submit", event => {
     event.preventDefault();
     const formData = new FormData($searchbar);
@@ -678,7 +945,7 @@ function setupSearch() {
     if (q) {
       href += "?q=" + q;
     }
-    location.href = href;
+    navigateTo(href);
   });
   if (PARAMS.q) {
     document.getElementById('search').value = PARAMS.q;
@@ -686,7 +953,6 @@ function setupSearch() {
 }
 
 function setupUploadFile() {
-  document.querySelector(".upload-file").classList.remove("hidden");
   document.getElementById("file").addEventListener("change", async e => {
     const files = e.target.files;
     for (let file of files) {
@@ -697,7 +963,6 @@ function setupUploadFile() {
 
 function setupNewFolder() {
   const $newFolder = document.querySelector(".new-folder");
-  $newFolder.classList.remove("hidden");
   $newFolder.addEventListener("click", () => {
     const name = prompt("Enter folder name");
     if (name) createFolder(name);
@@ -706,7 +971,6 @@ function setupNewFolder() {
 
 function setupNewFile() {
   const $newFile = document.querySelector(".new-file");
-  $newFile.classList.remove("hidden");
   $newFile.addEventListener("click", () => {
     const name = prompt("Enter file name");
     if (name) createFile(name);
@@ -1084,7 +1348,9 @@ async function putAcl() {
     });
     await assertResOK(res);
     $status.textContent = "Saved";
-    location.reload();
+    $modal.classList.add("hidden");
+    $diff.classList.add("hidden");
+    await refreshPage();
   } catch (err) {
     $status.textContent = "";
     $diffStatus.textContent = "";
@@ -1109,7 +1375,8 @@ async function removeWhitelist() {
     const res = await fetch(url, { method: "DELETE" });
     await assertResOK(res);
     $status.textContent = "Saved";
-    location.reload();
+    $modal.classList.add("hidden");
+    await refreshPage();
   } catch (err) {
     $status.textContent = "";
     alert(`Failed to remove acl rule, ${err.message}`);
@@ -1123,46 +1390,84 @@ function manageWhitelist(index) {
   openWhitelistModal(base + file.name);
 }
 
-async function setupEditorPage() {
-  const url = baseUrl();
+/**
+ * Wire the editor toolbar once. Content and visibility are re-applied by
+ * renderEditor() on every navigation.
+ */
+function setupEditorPage() {
+  const $moveFile = document.querySelector(".move-file");
+  $moveFile.addEventListener("click", async () => {
+    const url = baseUrl();
+    const query = location.href.slice(url.length);
+    const newFileUrl = await doMovePath(url);
+    if (newFileUrl) {
+      await navigateTo(newFileUrl + query);
+    }
+  });
 
+  const $deleteFile = document.querySelector(".delete-file");
+  $deleteFile.addEventListener("click", async () => {
+    const url = baseUrl();
+    const name = baseName(url);
+    await doDeletePath(name, url, async () => {
+      const parent = location.href.split(/[?#]/)[0].split("/").slice(0, -1).join("/");
+      await navigateTo(parent || "/");
+    });
+  });
+
+  const $saveBtn = document.querySelector(".save-btn");
+  $saveBtn.addEventListener("click", saveChange);
+}
+
+/**
+ * Show a short-lived status message.
+ */
+function showToast(message) {
+  let $toast = document.getElementById("dufs-toast");
+  if (!$toast) {
+    $toast = document.createElement("div");
+    $toast.id = "dufs-toast";
+    document.body.appendChild($toast);
+  }
+  $toast.textContent = message;
+  $toast.classList.add("show");
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(() => $toast.classList.remove("show"), 1600);
+}
+
+function applyEditorChrome(isEdit) {
   const $download = document.querySelector(".download");
   $download.classList.remove("hidden");
-  $download.href = url;
+  $download.href = baseUrl();
 
-  if (DATA.kind == "Edit") {
-    const $moveFile = document.querySelector(".move-file");
-    $moveFile.classList.remove("hidden");
-    $moveFile.addEventListener("click", async () => {
-      const query = location.href.slice(url.length);
-      const newFileUrl = await doMovePath(url);
-      if (newFileUrl) {
-        location.href = newFileUrl + query;
-      }
-    });
+  toggleControl(".move-file", isEdit);
+  toggleControl(".delete-file", isEdit);
+  toggleControl(".save-btn", isEdit && !!DATA.editable);
+  toggleControl(".upload-file", false);
+  toggleControl(".new-folder", false);
+  toggleControl(".new-file", false);
+  toggleControl(".ip-whitelist-btn", false);
+  toggleControl(".searchbar", false);
+}
 
-    const $deleteFile = document.querySelector(".delete-file");
-    $deleteFile.classList.remove("hidden");
-    $deleteFile.addEventListener("click", async () => {
-      const url = baseUrl();
-      const name = baseName(url);
-      await doDeletePath(name, url, () => {
-        location.href = location.href.split("/").slice(0, -1).join("/");
-      });
-    });
+/**
+ * Render an Edit/View page from DATA.
+ */
+async function renderEditor() {
+  const url = baseUrl();
+  const isEdit = DATA.kind === "Edit";
+  document.title = `${isEdit ? "Edit" : "View"} ${DATA.href} - Dufs`;
 
-    if (DATA.editable) {
-      const $saveBtn = document.querySelector(".save-btn");
-      $saveBtn.classList.remove("hidden");
-      $saveBtn.addEventListener("click", saveChange);
-    }
-  } else if (DATA.kind == "View") {
-    $editor.readonly = true;
-  }
+  applyEditorChrome(isEdit);
+
+  const $notEditable = document.querySelector(".not-editable");
+  $notEditable.classList.add("hidden");
+  $notEditable.textContent = "";
+  document.querySelectorAll(".editor-page iframe").forEach($el => $el.remove());
+  $editor.readonly = !isEdit;
+  $editor.classList.add("hidden");
 
   if (!DATA.editable) {
-    const $notEditable = document.querySelector(".not-editable");
-    const url = baseUrl();
     const ext = extName(baseName(url));
     if (IFRAME_FORMATS.find(v => v === ext)) {
       $notEditable.insertAdjacentHTML("afterend", `<iframe src="${url}" sandbox width="100%" height="${window.innerHeight - 100}px"></iframe>`);
@@ -1175,7 +1480,7 @@ async function setupEditorPage() {
 
   $editor.classList.remove("hidden");
   try {
-    const res = await fetch(baseUrl());
+    const res = await fetch(url);
     await assertResOK(res);
     const encoding = getEncoding(res.headers.get("content-type"));
     if (encoding === "utf-8") {
@@ -1192,6 +1497,35 @@ async function setupEditorPage() {
 }
 
 /**
+ * Swap the current page (index or editor) for another one without replacing
+ * the document.
+ */
+async function applyPage(data, url, push) {
+  DATA = data;
+  PARAMS = Object.fromEntries(new URL(url, location.href).searchParams.entries());
+  if (push) {
+    history.pushState({ dufs: true }, "", url);
+  }
+
+  const $breadcrumb = document.querySelector(".breadcrumb");
+  $breadcrumb.innerHTML = "";
+  addBreadcrumb(data.href, data.uri_prefix);
+
+  const isIndex = data.kind === "Index";
+  document.querySelector(".index-page").classList.toggle("hidden", !isIndex);
+  document.querySelector(".editor-page").classList.toggle("hidden", isIndex);
+  if (isIndex) {
+    $editor.classList.add("hidden");
+    document.querySelectorAll(".editor-page iframe").forEach($el => $el.remove());
+    document.querySelector(".not-editable").classList.add("hidden");
+    renderIndex();
+  } else {
+    await renderEditor();
+  }
+  window.scrollTo(0, 0);
+}
+
+/**
  * Delete path
  * @param {number} index
  * @returns
@@ -1202,6 +1536,7 @@ async function deletePath(index) {
   await doDeletePath(file.name, newUrl(file.name), () => {
     document.getElementById(`addPath${index}`)?.remove();
     DATA.paths[index] = null;
+    invalidateNavCache();
     if (!DATA.paths.find(v => !!v)) {
       $pathsTable.classList.add("hidden");
       $emptyFolder.textContent = DIR_EMPTY_NOTE;
@@ -1218,6 +1553,7 @@ async function doDeletePath(name, url, cb) {
       method: "DELETE",
     });
     await assertResOK(res);
+    invalidateNavCache();
     cb();
   } catch (err) {
     alert(`Cannot delete \`${file.name}\`, ${err.message}`);
@@ -1235,7 +1571,7 @@ async function movePath(index) {
   const fileUrl = newUrl(file.name);
   const newFileUrl = await doMovePath(fileUrl);
   if (newFileUrl) {
-    location.href = newFileUrl.split("/").slice(0, -1).join("/");
+    await navigateTo(newFileUrl.split("/").slice(0, -1).join("/"));
   }
 }
 
@@ -1269,6 +1605,7 @@ async function doMovePath(fileUrl) {
       }
     });
     await assertResOK(res2);
+    invalidateNavCache();
     return newFileUrl;
   } catch (err) {
     alert(`Cannot move \`${filePath}\` to \`${newPath}\`, ${err.message}`);
@@ -1281,11 +1618,13 @@ async function doMovePath(fileUrl) {
  */
 async function saveChange() {
   try {
-    await fetch(baseUrl(), {
+    const res = await fetch(baseUrl(), {
       method: "PUT",
       body: $editor.value,
     });
-    location.reload();
+    await assertResOK(res);
+    invalidateNavCache();
+    showToast("Saved");
   } catch (err) {
     alert(`Failed to save file, ${err.message}`);
   }
@@ -1330,7 +1669,8 @@ async function createFolder(name) {
       method: "MKCOL",
     });
     await assertResOK(res);
-    location.href = url;
+    invalidateNavCache();
+    await navigateTo(url.endsWith("/") ? url : url + "/");
   } catch (err) {
     alert(`Cannot create folder \`${name}\`, ${err.message}`);
   }
@@ -1345,7 +1685,8 @@ async function createFile(name) {
       body: "",
     });
     await assertResOK(res);
-    location.href = url + "?edit";
+    invalidateNavCache();
+    await navigateTo(url + "?edit");
   } catch (err) {
     alert(`Cannot create file \`${name}\`, ${err.message}`);
   }
@@ -1401,13 +1742,13 @@ function extName(filename) {
 function getPathSvg(path_type) {
   switch (path_type) {
     case "Dir":
-      return ICONS.dir;
+      return iconSvg("dir");
     case "SymlinkFile":
-      return ICONS.symlinkFile;
+      return iconSvg("symlinkFile");
     case "SymlinkDir":
-      return ICONS.symlinkDir;
+      return iconSvg("symlinkDir");
     default:
-      return ICONS.file;
+      return iconSvg("file");
   }
 }
 

@@ -692,3 +692,28 @@ svg {
   background: var(--text-accent);
   filter: brightness(1.08);
 }
+
+/* transient status message, e.g. after saving an edit */
+#dufs-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 32px;
+  transform: translate(-50%, 8px);
+  padding: 0.45em 1em;
+  font-size: 0.9em;
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  box-shadow: var(--shadow-modal);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .15s, transform .15s;
+  z-index: 200;
+}
+
+#dufs-toast.show {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+

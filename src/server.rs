@@ -88,9 +88,23 @@ impl Server {
         // index.js/index.css even when the crate version did not change.
         let assets_hash = {
             let mut hasher = Sha256::new();
-            hasher.update(INDEX_HTML.as_bytes());
-            hasher.update(INDEX_CSS.as_bytes());
-            hasher.update(INDEX_JS.as_bytes());
+            match args.assets.as_ref() {
+                // An overridden assets directory may be edited between runs;
+                // hash what is actually served so the browser cache-busting
+                // prefix follows the files on disk.
+                Some(dir) => {
+                    for name in ["index.html", "index.css", "index.js"] {
+                        if let Ok(bytes) = std::fs::read(dir.join(name)) {
+                            hasher.update(&bytes);
+                        }
+                    }
+                }
+                None => {
+                    hasher.update(INDEX_HTML.as_bytes());
+                    hasher.update(INDEX_CSS.as_bytes());
+                    hasher.update(INDEX_JS.as_bytes());
+                }
+            }
             hex::encode(&hasher.finalize()[..4])
         };
         let assets_prefix = format!("__dufs_v{}_{}__/", env!("CARGO_PKG_VERSION"), assets_hash);
