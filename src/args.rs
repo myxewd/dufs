@@ -124,7 +124,9 @@ pub fn build_cli() -> Command {
                 .env("DUFS_TRUSTED_PROXY")
                 .hide_env(true)
                 .long("trusted-proxy")
-                .help("Trust forwarded headers from these proxy addresses, e.g. 127.0.0.1,10.0.0.0/8")
+                .help(
+        "Trust forwarded headers from these proxy addresses (comma or space separated list of ips/cidr ranges), e.g. 127.0.0.1,10.0.0.0/8",
+    )
                 .action(ArgAction::Append)
                 .value_delimiter(',')
                 .value_name("addrs"),

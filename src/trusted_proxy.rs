@@ -16,20 +16,29 @@ pub struct TrustedProxies {
 }
 
 impl TrustedProxies {
-    /// Build from specs like `127.0.0.1` or `10.0.0.0/8`. Each spec may also
-    /// contain several comma separated addresses.
+    /// Build from specs like `127.0.0.1` or `10.0.0.0/8`.
+    ///
+    /// Each spec may contain several addresses separated by commas or by
+    /// whitespace, so all of these are equivalent:
+    ///
+    /// ```text
+    /// --trusted-proxy 192.168.16.10,10.194.0.0/24
+    /// --trusted-proxy "192.168.16.10 10.194.0.0/24"
+    /// --trusted-proxy 192.168.16.10 --trusted-proxy 10.194.0.0/24
+    /// ```
     pub fn new(specs: &[String]) -> Result<Self> {
         let mut nets = Vec::new();
         for spec in specs {
-            for part in spec.split(',') {
+            for part in spec.split(|c: char| c == ',' || c.is_whitespace()) {
                 let part = part.trim();
                 if part.is_empty() {
                     continue;
                 }
-                nets.push(
-                    part.parse::<IpNet>()
-                        .with_context(|| format!("invalid trusted proxy '{part}'"))?,
-                );
+                nets.push(part.parse::<IpNet>().with_context(|| {
+                    format!(
+                        "invalid trusted proxy '{part}', expected an ip address or a cidr range such as 192.168.16.10 or 10.194.0.0/24"
+                    )
+                })?);
             }
         }
         Ok(Self { nets })
@@ -221,6 +230,29 @@ mod tests {
         assert!(proxies.contains(ip("::1")));
         assert!(proxies.contains(ip("10.9.9.9")));
         assert!(!proxies.contains(ip("8.8.8.8")));
-        assert!(TrustedProxies::new(&["not-an-ip".to_owned()]).is_err());
+
+        // a single spec may hold a whitespace separated list
+        let proxies = TrustedProxies::new(&["192.168.16.10 10.194.0.0/24".to_owned()]).unwrap();
+        assert!(proxies.contains(ip("192.168.16.10")));
+        assert!(proxies.contains(ip("10.194.0.7")));
+        assert!(!proxies.contains(ip("10.195.0.1")));
+
+        // one entry per spec, mixed families and plain/cidr forms
+        let proxies = TrustedProxies::new(&[
+            "192.168.16.10".to_owned(),
+            "10.194.0.0/24".to_owned(),
+            "::1".to_owned(),
+        ])
+        .unwrap();
+        assert!(proxies.contains(ip("192.168.16.10")));
+        assert!(proxies.contains(ip("10.194.0.7")));
+        assert!(proxies.contains(ip("::1")));
+        assert!(!proxies.contains(ip("10.194.1.7")));
+
+        let err = TrustedProxies::new(&["not-an-ip".to_owned()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid trusted proxy 'not-an-ip'"), "{err}");
+        assert!(err.contains("10.194.0.0/24"), "{err}");
     }
 }

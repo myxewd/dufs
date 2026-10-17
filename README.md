@@ -63,7 +63,7 @@ Options:
   -a, --auth <rules>         Add auth roles, e.g. user:pass@/dir1:rw,/dir2
       --auth-type <type>     Select the authentication adapter [default: builtin] [possible values: builtin, oidc]
       --ip-whitelist <rules> Set ip whitelist for paths, e.g. 127.0.0.1,10.0.0.0/8@/dir1
-      --trusted-proxy <addrs> Trust forwarded headers from these proxy addresses, e.g. 127.0.0.1,10.0.0.0/8
+      --trusted-proxy <addrs> Trust forwarded headers from these proxy addresses (comma or space separated ip/cidr list), e.g. 127.0.0.1,10.0.0.0/8
   -A, --allow-all            Allow all operations
       --allow-upload         Allow upload files/folders
       --allow-delete         Allow delete files/folders
@@ -381,11 +381,15 @@ The stored file is authoritative. When management is enabled and no store exists
 
 By default the client address is the TCP peer. Behind a reverse proxy that peer is the proxy itself, so a whitelist of real client addresses would deny everyone. List the proxy addresses with `--trusted-proxy` and dufs then takes the client address from `X-Forwarded-For`, falling back to `X-Real-IP`, **only when the connection comes from one of them**.
 
+Each entry is either a plain address or a CIDR range, and entries can be separated by commas, by spaces, or by repeating the flag:
+
 ```sh
 dufs --ip-whitelist '203.0.113.9@/private' --trusted-proxy 127.0.0.1,10.0.0.0/8
+dufs --ip-whitelist '203.0.113.9@/private' --trusted-proxy '192.168.16.10 10.194.0.0/24'
+dufs --ip-whitelist '203.0.113.9@/private' --trusted-proxy 192.168.16.10 --trusted-proxy 10.194.0.0/24
 ```
 
-The forwarded list is read from right to left and the first address that is not itself a trusted proxy is used, so a well-behaved chain resolves to the real client while a spoofed prefix is ignored. The resolved address is also what `$remote_addr` logs.
+The forwarded list is read from right to left and the first address that is not itself a trusted proxy is used, so a well-behaved chain resolves to the real client while a spoofed prefix is ignored. The resolved address is also what `$remote_addr` logs, and it is returned to the client in the `X-Client-IP` response header, which makes a missing or wrong `--trusted-proxy` easy to spot.
 
 > Never list `0.0.0.0/0`, and make sure dufs is not directly reachable from untrusted clients: a trusted peer that is not really a proxy lets a client forge its address and bypass the whitelist.
 
