@@ -20,6 +20,11 @@ pub type Error = Box<dyn std::error::Error>;
 #[allow(dead_code)]
 static RESERVED_PORTS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
 
+/// UDP ports are reserved separately: the tcp fixture may hand out the same
+/// number, which is fine because the protocols are independent.
+#[allow(dead_code)]
+static RESERVED_UDP_PORTS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+
 #[allow(dead_code)]
 pub const BIN_FILE: &str = "😀.bin";
 
@@ -160,6 +165,49 @@ pub fn port() -> Port {
     Port::reserve()
 }
 
+/// A udp port picked for a single test and kept out of circulation until
+/// dropped.
+#[allow(dead_code)]
+pub struct UdpPort {
+    num: u16,
+}
+
+impl UdpPort {
+    fn reserve() -> UdpPort {
+        let mut reserved = RESERVED_UDP_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..100 {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0")
+                .expect("Couldn't find a free local udp port");
+            let num = socket.local_addr().unwrap().port();
+            drop(socket);
+            if !reserved.contains(&num) {
+                reserved.push(num);
+                return UdpPort { num };
+            }
+        }
+        panic!("Couldn't find a free local udp port");
+    }
+}
+
+impl Drop for UdpPort {
+    fn drop(&mut self) {
+        let mut reserved = RESERVED_UDP_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        reserved.retain(|num| *num != self.num);
+    }
+}
+
+impl std::fmt::Display for UdpPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.num.fmt(f)
+    }
+}
+
+#[fixture]
+#[allow(dead_code)]
+pub fn udp_port() -> UdpPort {
+    UdpPort::reserve()
+}
+
 /// Run dufs as a server; Start with a temporary directory, a free port and some
 /// optional arguments then wait for a while for the server setup to complete.
 #[fixture]
@@ -237,5 +285,66 @@ impl Drop for TestServer {
     fn drop(&mut self) {
         self.child.kill().expect("Couldn't kill test server");
         self.child.wait().unwrap();
+    }
+}
+
+/// Run dufs with tftp enabled on a free udp port bound to localhost.
+#[fixture]
+#[allow(dead_code)]
+pub fn tftp_server<I>(#[default(&[] as &[&str])] args: I) -> TestServerTftp
+where
+    I: IntoIterator + Clone,
+    I::Item: AsRef<std::ffi::OsStr>,
+{
+    let tmpdir = tmpdir();
+    let port = port();
+    let tftp_port = UdpPort::reserve();
+    let child = Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .arg("-p")
+        .arg(port.to_string())
+        .args(args.clone())
+        .arg("--tftp-port")
+        .arg(tftp_port.num.to_string())
+        .arg("--tftp-bind")
+        .arg("127.0.0.1")
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("Couldn't run test binary");
+    let is_tls = args
+        .into_iter()
+        .any(|x| x.as_ref().to_str().unwrap().contains("tls"));
+
+    wait_for_port(&port);
+    // The tcp listener is reachable before the tftp socket is bound.
+    sleep(Duration::from_millis(200));
+    TestServerTftp {
+        server: TestServer::new(port, tmpdir, child, is_tls),
+        tftp_port: tftp_port.num,
+    }
+}
+
+#[allow(dead_code)]
+pub struct TestServerTftp {
+    server: TestServer,
+    tftp_port: u16,
+}
+
+#[allow(dead_code)]
+impl TestServerTftp {
+    pub fn url(&self) -> Url {
+        self.server.url()
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        self.server.path()
+    }
+
+    pub fn tftp_port(&self) -> u16 {
+        self.tftp_port
+    }
+
+    pub fn tftp_addr(&self) -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([127, 0, 0, 1], self.tftp_port))
     }
 }

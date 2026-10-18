@@ -21,6 +21,7 @@ All notable changes to this project will be documented in this file.
 - Keep the acl dialog open on backdrop clicks, put locked inherited tags first, and add a filter to the full-list dialog
 - Fix the guest archive leaking the metadata dir, filter archives by the effective access, use an eye icon for the view action, and serve the plain favicon without an auth challenge
 - OIDC: keep the guest page visible without a session and log out through the provider end-session endpoint with an id_token hint
+- Add read-only TFTP downloads (`--tftp-port`), opt-in per path with an `Enable TFTP` acl switch that requires guest read access
 
 ## [0.46.0] - 2026-05-07
 

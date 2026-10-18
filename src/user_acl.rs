@@ -29,6 +29,11 @@ impl UserRule {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct UserNode {
     rule: Option<UserRule>,
+    /// Explicit tftp switch for this path. It lives next to the user rule but
+    /// is independent of it: a path may allow tftp without changing who may
+    /// read it, and a tftp-only node must not make the path "managed" for user
+    /// permissions.
+    tftp: Option<bool>,
     children: IndexMap<String, UserNode>,
 }
 
@@ -116,6 +121,106 @@ impl UserAcl {
             }
         }
         node.rule = None;
+    }
+
+    /// Remove both the user rule and the tftp switch configured exactly on
+    /// this path. Used when the ACL entry itself is deleted.
+    pub fn remove_all(&mut self, path: &str) {
+        let parts = split_path(path);
+        let mut node = &mut self.root;
+        for part in &parts {
+            match node.children.get_mut(*part) {
+                Some(child) => node = child,
+                None => return,
+            }
+        }
+        node.rule = None;
+        node.tftp = None;
+    }
+
+    /// Set the tftp switch for a path. None clears the explicit value, so the
+    /// nearest configured ancestor applies again.
+    pub fn set_tftp(&mut self, path: &str, enabled: Option<bool>) {
+        if enabled.is_none() {
+            let parts = split_path(path);
+            let mut node = &mut self.root;
+            for part in &parts {
+                match node.children.get_mut(*part) {
+                    Some(child) => node = child,
+                    None => return,
+                }
+            }
+            node.tftp = None;
+            return;
+        }
+        let parts = split_path(path);
+        let mut node = &mut self.root;
+        for part in parts {
+            node = node.children.entry(part.to_string()).or_default();
+        }
+        node.tftp = enabled;
+    }
+
+    /// The effective tftp switch for a path and the path that configured it.
+    /// The nearest explicit value wins; without one tftp is off.
+    pub async fn tftp_effective(&self, path: &str, root: Option<&Path>) -> (bool, Option<String>) {
+        let parts = split_path(path);
+        let mut node = &self.root;
+        let mut found = node.tftp.map(|v| (v, "/".to_string()));
+        let mut prefix = String::new();
+        for (i, name) in parts.iter().enumerate() {
+            let child = match node.children.get(*name) {
+                Some(child) => child,
+                None => match find_child_alias(&node.children, name, &parts[..i], root).await {
+                    Some(child) => child,
+                    None => break,
+                },
+            };
+            node = child;
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(name);
+            if let Some(v) = node.tftp {
+                found = Some((v, format!("/{prefix}")));
+            }
+        }
+        match found {
+            Some((enabled, path)) => (enabled, Some(path)),
+            None => (false, None),
+        }
+    }
+
+    /// The tftp switch configured on this exact path, if any. Inherited values
+    /// are not included.
+    pub async fn tftp_own(&self, path: &str, root: Option<&Path>) -> Option<bool> {
+        self.find_node(path, root).await.and_then(|node| node.tftp)
+    }
+
+    /// All explicitly configured tftp switches as path/enabled pairs.
+    pub fn tftp_rules(&self) -> BTreeMap<String, bool> {
+        let mut output = BTreeMap::new();
+        self.collect_tftp(&self.root, String::new(), &mut output);
+        output
+    }
+
+    fn collect_tftp(&self, node: &UserNode, prefix: String, output: &mut BTreeMap<String, bool>) {
+        if let Some(enabled) = node.tftp {
+            let path = if prefix.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{prefix}")
+            };
+            output.insert(path, enabled);
+        }
+        for (name, child) in &node.children {
+            let next = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            self.collect_tftp(child, next, output);
+        }
     }
 
     /// The nearest rule covering the path, or `None` when the path is not
@@ -418,8 +523,7 @@ impl UserAcl {
         };
         let src = stored.trim_end_matches('/');
         let to = to.trim_matches('/');
-        let mut moved: Vec<(String, String, UserRule)> = vec![];
-        for (path, rule) in self.rules() {
+        let target_of = |path: &str| -> Option<String> {
             let suffix = if src.is_empty() {
                 // moving the served root cannot happen over http; keep the
                 // rule paths as they are below the new prefix
@@ -427,25 +531,37 @@ impl UserAcl {
             } else if path == src {
                 ""
             } else {
-                match path.strip_prefix(src).and_then(|v| v.strip_prefix('/')) {
-                    Some(suffix) => suffix,
-                    None => continue,
-                }
+                path.strip_prefix(src).and_then(|v| v.strip_prefix('/'))?
             };
-            let target = match (to.is_empty(), suffix.is_empty()) {
+            Some(match (to.is_empty(), suffix.is_empty()) {
                 (true, true) => "/".to_string(),
                 (true, false) => format!("/{suffix}"),
                 (false, true) => format!("/{to}"),
                 (false, false) => format!("/{to}/{suffix}"),
-            };
-            moved.push((path, target, rule));
-        }
+            })
+        };
+        let moved: Vec<(String, String, UserRule)> = self
+            .rules()
+            .into_iter()
+            .filter_map(|(path, rule)| target_of(&path).map(|target| (path, target, rule)))
+            .collect();
+        let moved_tftp: Vec<(String, String, bool)> = self
+            .tftp_rules()
+            .into_iter()
+            .filter_map(|(path, enabled)| target_of(&path).map(|target| (path, target, enabled)))
+            .collect();
         for (path, _, _) in &moved {
             self.remove(path);
         }
-        let count = moved.len();
+        for (path, _, _) in &moved_tftp {
+            self.set_tftp(path, None);
+        }
+        let count = moved.len() + moved_tftp.len();
         for (_, target, rule) in moved {
             self.insert(&target, rule);
+        }
+        for (_, target, enabled) in moved_tftp {
+            self.set_tftp(&target, Some(enabled));
         }
         count
     }
@@ -458,10 +574,11 @@ impl UserAcl {
             return 0;
         };
         let src = stored.trim_end_matches('/');
-        let targets: Vec<String> = self
+        let mut targets: Vec<String> = self
             .rules()
             .into_iter()
             .map(|(path, _)| path)
+            .chain(self.tftp_rules().into_keys())
             .filter(|path| {
                 if src.is_empty() {
                     true
@@ -471,15 +588,17 @@ impl UserAcl {
                 }
             })
             .collect();
+        targets.sort_unstable();
+        targets.dedup();
         for path in &targets {
-            self.remove(path);
+            self.remove_all(path);
         }
         targets.len()
     }
 
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.rules().is_empty()
+        self.rules().is_empty() && self.tftp_rules().is_empty()
     }
 
     /// All explicitly configured rules as `(path, rule)` pairs.
@@ -592,7 +711,7 @@ fn split_path(path: &str) -> Vec<&str> {
 /// File inside the metadata directory that stores the per-path user acl.
 pub const USER_ACL_FILE: &str = "user-acl.json";
 
-const STORE_VERSION: u32 = 1;
+const STORE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreFile {
@@ -600,6 +719,10 @@ pub struct StoreFile {
     pub version: u32,
     #[serde(default)]
     pub rules: BTreeMap<String, UserRule>,
+    /// Per-path tftp switches. A missing path inherits the nearest ancestor
+    /// and defaults to off.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tftp: BTreeMap<String, bool>,
 }
 
 fn store_version() -> u32 {
@@ -611,6 +734,7 @@ impl StoreFile {
         Self {
             version: STORE_VERSION,
             rules: acl.rules().into_iter().collect(),
+            tftp: acl.tftp_rules(),
         }
     }
 
@@ -618,6 +742,9 @@ impl StoreFile {
         let mut acl = UserAcl::default();
         for (path, rule) in &self.rules {
             acl.insert(path, rule.clone());
+        }
+        for (path, enabled) in &self.tftp {
+            acl.set_tftp(path, Some(*enabled));
         }
         acl
     }
@@ -1143,5 +1270,65 @@ mod tests {
         assert_eq!(acl.perm("/child", "alice", None).await, Some(AclPerm::Deny));
         assert_eq!(acl.perm("/child", "bob", None).await, Some(AclPerm::Deny));
         assert_eq!(acl.perm("/", "alice", None).await, Some(AclPerm::Read));
+    }
+
+    #[tokio::test]
+    async fn test_tftp_switch_is_independent_and_inherited() {
+        let mut acl = UserAcl::default();
+        // no setting anywhere -> off
+        assert!(!acl.tftp_effective("a/b", None).await.0);
+        assert_eq!(acl.tftp_effective("a/b", None).await.1, None);
+
+        acl.set_tftp("/public", Some(true));
+        assert!(acl.tftp_effective("public/file", None).await.0);
+        assert_eq!(
+            acl.tftp_effective("public/file", None).await.1.as_deref(),
+            Some("/public")
+        );
+        assert!(acl.tftp_effective("public", None).await.0);
+        // an explicit child value overrides the ancestor for its subtree
+        acl.set_tftp("/public/secret", Some(false));
+        assert!(!acl.tftp_effective("public/secret/file", None).await.0);
+        assert!(acl.tftp_effective("public/other", None).await.0);
+        assert_eq!(acl.tftp_own("public/file", None).await, None);
+        assert_eq!(acl.tftp_own("public/secret", None).await, Some(false));
+
+        // a tftp-only node must not make the path managed for user permissions
+        let mut acl = UserAcl::default();
+        acl.set_tftp("/tftponly", Some(true));
+        assert!(!acl.is_empty());
+        assert!(!acl.has_rules("/tftponly", None).await);
+        assert_eq!(acl.perm("tftponly", "alice", None).await, None);
+        assert_eq!(acl.rules(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn test_tftp_store_roundtrip_and_rename() {
+        let dir = assert_fs::TempDir::new().unwrap();
+        let root = dir.path();
+        let mut acl = UserAcl::default();
+        acl.insert("/dir", rule(&["alice"], &[], &[]));
+        acl.set_tftp("/dir", Some(true));
+        acl.set_tftp("/dir/secret", Some(false));
+        save(root, &acl).unwrap();
+        let loaded = load(root).unwrap();
+        assert_eq!(loaded.tftp_rules(), acl.tftp_rules());
+        assert!(loaded.tftp_effective("dir/file", Some(root)).await.0);
+        assert!(!loaded.tftp_effective("dir/secret/file", Some(root)).await.0);
+        // adding tftp does not change the user decision
+        assert_eq!(
+            loaded.perm("dir", "alice", Some(root)).await,
+            Some(AclPerm::Read)
+        );
+
+        let mut acl = UserAcl::default();
+        acl.set_tftp("/team", Some(true));
+        acl.set_tftp("/team/secret", Some(false));
+        assert_eq!(acl.rename("/team", "/team2", None).await, 2);
+        assert!(acl.tftp_effective("team2/a", None).await.0);
+        assert!(!acl.tftp_effective("team2/secret/a", None).await.0);
+        assert!(!acl.tftp_effective("team/a", None).await.0);
+        assert_eq!(acl.remove_tree("/team2", None).await, 2);
+        assert!(!acl.tftp_effective("team2/a", None).await.0);
     }
 }

@@ -1,7 +1,7 @@
 use bytes::{Bytes, BytesMut};
 use futures_util::Stream;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
-use hyper::body::{Body, Incoming};
+use hyper::body::Body;
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -9,19 +9,27 @@ use std::{
 use tokio::io::AsyncRead;
 use tokio_util::io::poll_read_buf;
 
+/// Turn any hyper request body into a stream of data frames.
+///
+/// The server normally receives a hyper Incoming body, but the tftp
+/// dispatcher builds a synthetic request whose body is an empty body; keeping
+/// this generic lets both use the same upload path.
 #[derive(Debug)]
-pub struct IncomingStream {
-    inner: Incoming,
+pub struct IncomingStream<B> {
+    inner: B,
 }
 
-impl IncomingStream {
-    pub fn new(inner: Incoming) -> Self {
+impl<B> IncomingStream<B> {
+    pub fn new(inner: B) -> Self {
         Self { inner }
     }
 }
 
-impl Stream for IncomingStream {
-    type Item = Result<Bytes, anyhow::Error>;
+impl<B> Stream for IncomingStream<B>
+where
+    B: Body<Data = Bytes> + Unpin,
+{
+    type Item = Result<Bytes, B::Error>;
 
     #[inline]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {

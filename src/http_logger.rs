@@ -30,7 +30,7 @@ enum LogElement {
 }
 
 impl HttpLogger {
-    pub fn data(&self, req: &Request) -> HashMap<String, String> {
+    pub fn data<B>(&self, req: &Request<B>) -> HashMap<String, String> {
         let mut data = HashMap::default();
         for element in self.elements.iter() {
             match element {

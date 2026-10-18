@@ -18,6 +18,7 @@ Dufs is a distinctive utility file server that supports static serving, uploadin
 - Access control
 - Support https
 - Support webdav
+- Support read-only tftp downloads (opt-in, per-path)
 - Easy to use with curl
 
 ## Install
@@ -58,6 +59,10 @@ Options:
   -c, --config <file>        Specify configuration file
   -b, --bind <addrs>         Specify bind address or unix socket
   -p, --port <port>          Specify port to listen on [default: 5000]
+      --tftp-port <port>     Enable TFTP downloads on this UDP port, e.g. 69
+      --tftp-bind <addrs>    Specify tftp bind addresses [default: the --bind ip addresses]
+      --tftp-block-size <size> Set the maximum tftp block size [default: 1468]
+      --tftp-timeout <secs>  Set the tftp retry timeout in seconds [default: 3]
       --path-prefix <path>   Specify a path prefix
       --hidden <value>       Hide paths from directory listings, e.g. tmp,*.log,*.lock
   -a, --auth <rules>         Add auth roles, e.g. user:pass@/dir1:rw,/dir2
@@ -381,6 +386,20 @@ dufs --allow-ip-whitelist
 
 The stored file is authoritative. When management is enabled and no store exists yet, the `--ip-whitelist` rules seed it; a CLI-only run keeps those rules in memory instead. Delete `.dufs/ip-whitelist.json` to start over.
 
+#### TFTP
+
+Dufs can expose files over TFTP for clients that only speak TFTP (PXE, network devices). It is disabled by default and is opt-in per path:
+
+```sh
+dufs --allow-ip-whitelist --tftp-port 69
+```
+
+Open the shield button for a file or directory and check `Enable TFTP`, then save. The switch is stored in `.dufs/user-acl.json`. The checkbox is only enabled when `guest` can read the path; saving an acl that revokes guest read forces the switch off. A path without the switch is not reachable over TFTP.
+
+TFTP is read-only (uploads are rejected), unauthenticated and unencrypted. The IP whitelist, per-path acl, `--auth` guest identity and all other read checks still run for each request, using the UDP peer address (TFTP has no `X-Forwarded-For`). Only regular files are served; dynamic endpoints, directory listings and the metadata directory are rejected. Because UDP source addresses can be spoofed, use TFTP only on trusted networks, bind it to a specific address with `--tftp-bind`, and keep it off otherwise.
+
+`--tftp-block-size` (default 1468) limits the negotiated block size and `--tftp-timeout` (default 3s) is the retry timeout. TFTP listens on the `--bind` IP addresses unless `--tftp-bind` is given; it needs a served directory, so it cannot be combined with a single-file `serve-path`. On Unix, binding port 69 needs root or `CAP_NET_BIND_SERVICE`.
+
 #### Behind a reverse proxy
 
 By default the client address is the TCP peer. Behind a reverse proxy that peer is the proxy itself, so a whitelist of real client addresses would deny everyone. List the proxy addresses with `--trusted-proxy` and dufs then takes the client address from `X-Forwarded-For`, falling back to `X-Real-IP`, **only when the connection comes from one of them**.
@@ -471,6 +490,10 @@ All options can be set using environment variables prefixed with `DUFS_`.
     --config <file>         DUFS_CONFIG=config.yaml
 -b, --bind <addrs>          DUFS_BIND=0.0.0.0
 -p, --port <port>           DUFS_PORT=5000
+    --tftp-port <port>      DUFS_TFTP_PORT=69
+    --tftp-bind <addrs>     DUFS_TFTP_BIND=127.0.0.1
+    --tftp-block-size <n>   DUFS_TFTP_BLOCK_SIZE=1468
+    --tftp-timeout <secs>   DUFS_TFTP_TIMEOUT=3
     --path-prefix <path>    DUFS_PATH_PREFIX=/dufs
     --hidden <value>        DUFS_HIDDEN=tmp,*.log,*.lock
 -a, --auth <rules>          DUFS_AUTH="admin:admin@/:rw|@/" 
@@ -507,6 +530,11 @@ The following are the configuration items:
 serve-path: '.'
 bind: 0.0.0.0
 port: 5000
+# tftp-port: 69
+# tftp-bind:
+#   - 127.0.0.1
+# tftp-block-size: 1468
+# tftp-timeout: 3
 path-prefix: /dufs
 hidden:
   - tmp

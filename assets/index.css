@@ -521,6 +521,26 @@ svg {
   outline: none;
 }
 
+.acl-tftp {
+  display: flex;
+  align-items: center;
+  gap: 0.45em;
+  margin-top: 0.5em;
+  font-size: 0.88em;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.acl-tftp input {
+  margin: 0;
+  accent-color: var(--text-accent);
+}
+
+.acl-tftp:has(input:disabled) {
+  color: var(--text-secondary);
+  cursor: default;
+}
+
 .acl-diff-body {
   font-family: monospace;
   font-size: 0.85em;

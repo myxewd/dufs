@@ -63,6 +63,43 @@ pub fn build_cli() -> Command {
                 .value_name("port"),
         )
         .arg(
+            Arg::new("tftp-port")
+                .env("DUFS_TFTP_PORT")
+                .hide_env(true)
+                .long("tftp-port")
+                .value_parser(value_parser!(u16))
+                .help("Enable TFTP downloads on this UDP port, e.g. 69")
+                .value_name("port"),
+        )
+        .arg(
+            Arg::new("tftp-bind")
+                .env("DUFS_TFTP_BIND")
+                .hide_env(true)
+                .long("tftp-bind")
+                .action(ArgAction::Append)
+                .value_delimiter(',')
+                .help("Specify tftp bind addresses [default: the --bind ip addresses]")
+                .value_name("addrs"),
+        )
+        .arg(
+            Arg::new("tftp-block-size")
+                .env("DUFS_TFTP_BLOCK_SIZE")
+                .hide_env(true)
+                .long("tftp-block-size")
+                .value_parser(value_parser!(u16))
+                .help("Set the maximum tftp block size [default: 1468]")
+                .value_name("size"),
+        )
+        .arg(
+            Arg::new("tftp-timeout")
+                .env("DUFS_TFTP_TIMEOUT")
+                .hide_env(true)
+                .long("tftp-timeout")
+                .value_parser(value_parser!(u64))
+                .help("Set the tftp retry timeout in seconds [default: 3]")
+                .value_name("secs"),
+        )
+        .arg(
             Arg::new("path-prefix")
                 .env("DUFS_PATH_PREFIX")
 				.hide_env(true)
@@ -314,6 +351,16 @@ pub struct Args {
     #[serde(default = "default_port")]
     #[default(default_port())]
     pub port: u16,
+    #[serde(default)]
+    pub tftp_port: Option<u16>,
+    #[serde(deserialize_with = "deserialize_string_or_vec")]
+    pub tftp_bind: Vec<String>,
+    #[serde(default = "default_tftp_block_size")]
+    #[default(default_tftp_block_size())]
+    pub tftp_block_size: u16,
+    #[serde(default = "default_tftp_timeout")]
+    #[default(default_tftp_timeout())]
+    pub tftp_timeout: u64,
     #[serde(skip)]
     pub path_is_file: bool,
     pub path_prefix: String,
@@ -375,6 +422,22 @@ impl Args {
 
         if let Some(port) = matches.get_one::<u16>("port") {
             args.port = *port
+        }
+
+        if let Some(port) = matches.get_one::<u16>("tftp-port") {
+            args.tftp_port = Some(*port);
+        }
+
+        if let Some(addrs) = matches.get_many::<String>("tftp-bind") {
+            args.tftp_bind = addrs.cloned().collect();
+        }
+
+        if let Some(size) = matches.get_one::<u16>("tftp-block-size") {
+            args.tftp_block_size = *size;
+        }
+
+        if let Some(secs) = matches.get_one::<u64>("tftp-timeout") {
+            args.tftp_timeout = *secs;
         }
 
         if let Some(addrs) = matches.get_many::<String>("bind") {
@@ -517,7 +580,53 @@ impl Args {
             args.tls_key = None;
         }
 
+        if args.tftp_port.is_some() {
+            if args.path_is_file {
+                bail!("TFTP cannot be used when serving a single file");
+            }
+            if !(8..=65464).contains(&args.tftp_block_size) {
+                bail!("Invalid tftp-block-size, expected a value between 8 and 65464");
+            }
+            if args.tftp_timeout == 0 || args.tftp_timeout > 255 {
+                bail!("Invalid tftp-timeout, expected a value between 1 and 255");
+            }
+            if args.tftp_port == Some(0) {
+                bail!("Invalid tftp-port, expected a value between 1 and 65535");
+            }
+            if args.tftp_addrs()?.is_empty() {
+                bail!("TFTP requires an ip bind address, set --tftp-bind or --bind");
+            }
+        }
+
         Ok(args)
+    }
+
+    /// Resolve the UDP addresses the tftp server binds. Explicit --tftp-bind
+    /// entries win; otherwise the ip addresses of --bind are reused.
+    pub fn tftp_addrs(&self) -> Result<Vec<IpAddr>> {
+        if !self.tftp_bind.is_empty() {
+            let mut addrs: Vec<IpAddr> = vec![];
+            for spec in &self.tftp_bind {
+                for part in spec.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                    let ip = part.parse::<IpAddr>().with_context(|| {
+                        format!("Invalid tftp bind address '{part}', expected an ip address")
+                    })?;
+                    if !addrs.contains(&ip) {
+                        addrs.push(ip);
+                    }
+                }
+            }
+            return Ok(addrs);
+        }
+        let mut addrs = vec![];
+        for addr in &self.addrs {
+            match addr {
+                BindAddr::IpAddr(ip) => addrs.push(*ip),
+                #[cfg(unix)]
+                BindAddr::SocketPath(_) => {}
+            }
+        }
+        Ok(addrs)
     }
 
     fn sanitize_path<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
@@ -737,6 +846,14 @@ fn default_addrs() -> Vec<BindAddr> {
 
 fn default_port() -> u16 {
     5000
+}
+
+fn default_tftp_block_size() -> u16 {
+    1468
+}
+
+fn default_tftp_timeout() -> u64 {
+    3
 }
 
 #[cfg(test)]
@@ -979,5 +1096,101 @@ hidden:
             .try_get_matches_from(vec!["", "-c", &config_file.to_string_lossy()])
             .unwrap();
         assert_eq!(Args::parse(matches).unwrap().auth_type, AuthType::Oidc);
+    }
+
+    #[test]
+    fn test_args_tftp_cli() {
+        let cli = build_cli();
+        let matches = cli
+            .try_get_matches_from(vec!["", "--tftp-port", "6969"])
+            .unwrap();
+        let args = Args::parse(matches).unwrap();
+        assert_eq!(args.tftp_port, Some(6969));
+        assert_eq!(args.tftp_block_size, 1468);
+        assert_eq!(args.tftp_timeout, 3);
+        assert!(args
+            .tftp_addrs()
+            .unwrap()
+            .contains(&"0.0.0.0".parse().unwrap()));
+
+        let cli = build_cli();
+        let matches = cli
+            .try_get_matches_from(vec![
+                "",
+                "--tftp-port",
+                "6969",
+                "--tftp-bind",
+                "127.0.0.1,::1",
+                "--tftp-block-size",
+                "1024",
+                "--tftp-timeout",
+                "5",
+            ])
+            .unwrap();
+        let args = Args::parse(matches).unwrap();
+        assert_eq!(
+            args.tftp_addrs().unwrap(),
+            vec![
+                "127.0.0.1".parse::<IpAddr>().unwrap(),
+                "::1".parse::<IpAddr>().unwrap()
+            ]
+        );
+        assert_eq!(args.tftp_block_size, 1024);
+        assert_eq!(args.tftp_timeout, 5);
+    }
+
+    #[test]
+    fn test_args_tftp_invalid() {
+        for extra in [
+            vec!["--tftp-port", "0"],
+            vec!["--tftp-port", "69", "--tftp-block-size", "7"],
+            vec!["--tftp-port", "69", "--tftp-timeout", "0"],
+            vec!["--tftp-port", "69", "--tftp-bind", "not-an-ip"],
+        ] {
+            let mut argv = vec![""];
+            argv.extend(extra);
+            let cli = build_cli();
+            let matches = cli.try_get_matches_from(argv).unwrap();
+            assert!(Args::parse(matches).is_err());
+        }
+    }
+
+    #[test]
+    fn test_args_tftp_config() {
+        let tmpdir = assert_fs::TempDir::new().unwrap();
+        let config_file = tmpdir.child("config.yaml");
+        config_file
+            .write_str(
+                "tftp-port: 6969\ntftp-bind: 127.0.0.1\ntftp-block-size: 1024\ntftp-timeout: 5\n",
+            )
+            .unwrap();
+        let matches = build_cli()
+            .try_get_matches_from(vec!["", "-c", &config_file.to_string_lossy()])
+            .unwrap();
+        let args = Args::parse(matches).unwrap();
+        assert_eq!(args.tftp_port, Some(6969));
+        assert_eq!(
+            args.tftp_addrs().unwrap(),
+            vec!["127.0.0.1".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(args.tftp_block_size, 1024);
+        assert_eq!(args.tftp_timeout, 5);
+    }
+
+    #[test]
+    fn test_args_tftp_single_file_rejected() {
+        let tmpdir = assert_fs::TempDir::new().unwrap();
+        let file = tmpdir.child("file.txt");
+        file.write_str("x").unwrap();
+        let cli = build_cli();
+        let matches = cli
+            .try_get_matches_from(vec![
+                "",
+                file.path().to_str().unwrap(),
+                "--tftp-port",
+                "6969",
+            ])
+            .unwrap();
+        assert!(Args::parse(matches).is_err());
     }
 }

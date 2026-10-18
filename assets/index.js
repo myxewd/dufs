@@ -985,6 +985,11 @@ var ACL_OWN_BEFORE = { allow_read: [], allow_write: [], deny_read: [] };
 var ACL_INHERITED = { allow_read: [], allow_write: [], deny_read: [] };
 var ACL_BEFORE = { allow_read: [], allow_write: [], deny_read: [] };
 var ACL_DATA = { ips: [], allow_read: [], allow_write: [], deny_read: [] };
+var ACL_TFTP = false;
+var ACL_TFTP_BEFORE = false;
+var ACL_GUEST_READABLE = true;
+var ACL_OWN_NULL = { allow_read: true, allow_write: true, deny_read: true };
+var ACL_IPS_BEFORE = [];
 
 function setupIpWhitelist() {
   const $modal = document.getElementById("whitelistModal");
@@ -1005,6 +1010,18 @@ function setupIpWhitelist() {
   const $diff = document.getElementById("aclDiffModal");
   $diff.querySelector(".acl-diff-cancel").addEventListener("click", () => $diff.classList.add("hidden"));
   $diff.querySelector(".acl-diff-confirm").addEventListener("click", confirmAclSave);
+
+  const $tftp = $modal.querySelector(".acl-tftp-input");
+  if ($tftp) {
+    $tftp.addEventListener("change", () => {
+      if ($tftp.disabled) {
+        $tftp.checked = false;
+        ACL_TFTP = false;
+        return;
+      }
+      ACL_TFTP = $tftp.checked;
+    });
+  }
 
   $modal.querySelectorAll(".acl-tab").forEach(tab => {
     tab.addEventListener("click", () => {
@@ -1138,6 +1155,15 @@ async function openWhitelistModal(path) {
       allow_write: [...ACL_OWN_BEFORE.allow_write],
       deny_read: [...ACL_OWN_BEFORE.deny_read],
     };
+    ACL_OWN_NULL = {
+      allow_read: own.allow_read === null || own.allow_read === undefined,
+      allow_write: own.allow_write === null || own.allow_write === undefined,
+      deny_read: own.deny_read === null || own.deny_read === undefined,
+    };
+    ACL_GUEST_READABLE = data.guest_readable !== false;
+    ACL_TFTP_BEFORE = !!data.enable_tftp;
+    ACL_TFTP = ACL_TFTP_BEFORE;
+    ACL_IPS_BEFORE = [...ACL_DATA.ips];
     $modal.querySelector(".whitelist-input").value = ACL_DATA.ips.join(", ");
     renderAclLists();
   } catch (err) {
@@ -1222,6 +1248,32 @@ function renderAclLists() {
     ];
     $tags.innerHTML = tags.join("");
   }
+  updateTftpState();
+}
+
+function updateTftpState() {
+  const $modal = document.getElementById("whitelistModal");
+  const $input = $modal.querySelector(".acl-tftp-input");
+  if (!$input) return;
+  const eff = effectiveLists(ACL_DATA, ACL_INHERITED);
+  const guestMentioned = eff.allow_read.includes("guest")
+    || eff.allow_write.includes("guest")
+    || eff.deny_read.includes("guest");
+  // When the edited lists mention guest they decide; otherwise fall back to
+  // the server's view, which also accounts for --auth and inherited rules.
+  const guestReadable = guestMentioned
+    ? !eff.deny_read.includes("guest")
+    : ACL_GUEST_READABLE;
+  if (!guestReadable) {
+    ACL_TFTP = false;
+    $input.checked = false;
+  } else {
+    $input.checked = ACL_TFTP;
+  }
+  $input.disabled = !guestReadable;
+  $input.title = guestReadable
+    ? ""
+    : "Disabled: guest cannot read this path. Grant guest read access first.";
 }
 
 function tagHtml(user, list, inherited) {
@@ -1291,9 +1343,13 @@ function aclChanges() {
   return changes;
 }
 
-function showAclDiff(changes) {
+function showAclDiff(changes, tftpChanged) {
   const $diff = document.getElementById("aclDiffModal");
   const lines = [`Path: ${ACL_PATH}`];
+  if (tftpChanged) {
+    lines.push("");
+    lines.push(`TFTP: ${ACL_TFTP ? "enabled" : "disabled"} (was ${ACL_TFTP_BEFORE ? "enabled" : "disabled"})`);
+  }
   for (const change of changes) {
     lines.push("");
     lines.push(`${change.user}: current ${change.before} -> target ${change.after}`);
@@ -1319,8 +1375,9 @@ function showAclDiff(changes) {
 async function saveWhitelist() {
   normalizeAclLists();
   const changes = aclChanges();
-  if (changes.length > 0) {
-    showAclDiff(changes);
+  const tftpChanged = ACL_TFTP !== ACL_TFTP_BEFORE;
+  if (changes.length > 0 || tftpChanged) {
+    showAclDiff(changes, tftpChanged);
     return;
   }
   await putAcl();
@@ -1332,19 +1389,37 @@ async function putAcl() {
   const $diff = document.getElementById("aclDiffModal");
   const $diffStatus = $diff.querySelector(".modal-status");
   const ips = parseWhitelistInput($modal.querySelector(".whitelist-input").value);
+  const tftpChanged = ACL_TFTP !== ACL_TFTP_BEFORE;
+  const ipChanged = JSON.stringify(ips) !== JSON.stringify(ACL_IPS_BEFORE);
+  // A path without a user rule must stay without one when only the tftp
+  // switch is edited; sending empty lists would turn it into "deny everyone".
+  // An existing own rule is always sent back unchanged.
+  const omitLists = tftpChanged
+    && aclChanges().length === 0
+    && ACL_OWN_NULL.allow_read
+    && ACL_OWN_NULL.allow_write
+    && ACL_OWN_NULL.deny_read;
   $status.textContent = "Saving...";
   $diffStatus.textContent = "Saving...";
   try {
+    const payload = {
+      version: ACL_VERSION,
+    };
+    if (!omitLists) {
+      payload.allow_read = ACL_DATA.allow_read;
+      payload.allow_write = ACL_DATA.allow_write;
+      payload.deny_read = ACL_DATA.deny_read;
+    }
+    if (!omitLists || ipChanged) {
+      payload.ips = ips;
+    }
+    if (tftpChanged) {
+      payload.enable_tftp = ACL_TFTP;
+    }
     const res = await fetch(aclUrl(ACL_PATH), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        version: ACL_VERSION,
-        ips,
-        allow_read: ACL_DATA.allow_read,
-        allow_write: ACL_DATA.allow_write,
-        deny_read: ACL_DATA.deny_read,
-      }),
+      body: JSON.stringify(payload),
     });
     await assertResOK(res);
     $status.textContent = "Saved";

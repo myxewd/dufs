@@ -8,6 +8,7 @@ mod logger;
 mod noscript;
 mod oidc;
 mod server;
+mod tftp;
 mod trusted_proxy;
 mod user_acl;
 mod utils;
@@ -63,7 +64,7 @@ async fn main() -> Result<()> {
     args.addrs = new_addrs;
     let running = Arc::new(AtomicBool::new(true));
     let listening = print_listening(&args, &print_addrs)?;
-    let handles = serve(args, running.clone())?;
+    let handles = serve(args, running.clone()).await?;
     println!("{listening}");
 
     tokio::select! {
@@ -82,10 +83,18 @@ async fn main() -> Result<()> {
     }
 }
 
-fn serve(args: Args, running: Arc<AtomicBool>) -> Result<Vec<JoinHandle<()>>> {
+async fn serve(args: Args, running: Arc<AtomicBool>) -> Result<Vec<JoinHandle<()>>> {
     let addrs = args.addrs.clone();
     let port = args.port;
     let tls_config = (args.tls_cert.clone(), args.tls_key.clone());
+    let tftp_port = args.tftp_port;
+    let tftp_addrs = if tftp_port.is_some() {
+        args.tftp_addrs()?
+    } else {
+        vec![]
+    };
+    let tftp_block_size = args.tftp_block_size;
+    let tftp_timeout = args.tftp_timeout;
     let server_handle = Arc::new(Server::init(args, running)?);
     let mut handles = vec![];
     for bind_addr in addrs.iter() {
@@ -182,6 +191,21 @@ fn serve(args: Args, running: Arc<AtomicBool>) -> Result<Vec<JoinHandle<()>>> {
             }
         }
     }
+
+    if let Some(tftp_port) = tftp_port {
+        handles.extend(
+            tftp::serve(
+                server_handle.clone(),
+                tftp_port,
+                &tftp_addrs,
+                tftp_block_size,
+                tftp_timeout,
+            )
+            .await
+            .with_context(|| format!("Failed to start tftp on port {tftp_port}"))?,
+        );
+    }
+
     Ok(handles)
 }
 
@@ -281,7 +305,7 @@ fn interface_addrs() -> Result<(Vec<BindAddr>, Vec<BindAddr>)> {
 
 fn print_listening(args: &Args, print_addrs: &[BindAddr]) -> Result<String> {
     let mut output = String::new();
-    let urls = print_addrs
+    let mut urls = print_addrs
         .iter()
         .map(|bind_addr| match bind_addr {
             BindAddr::IpAddr(addr) => {
@@ -300,6 +324,16 @@ fn print_listening(args: &Args, print_addrs: &[BindAddr]) -> Result<String> {
             BindAddr::SocketPath(path) => path.to_string(),
         })
         .collect::<Vec<_>>();
+
+    if let Some(port) = args.tftp_port {
+        for ip in args.tftp_addrs()? {
+            let host = match ip {
+                IpAddr::V4(_) => ip.to_string(),
+                IpAddr::V6(_) => format!("[{ip}]"),
+            };
+            urls.push(format!("tftp://{host}:{port}"));
+        }
+    }
 
     if urls.len() == 1 {
         output.push_str(&format!("Listening on {}", urls[0]))

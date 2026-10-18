@@ -24,7 +24,7 @@ use headers::{
     ContentLength, ContentType, ETag, HeaderMap, HeaderMapExt, IfMatch, IfModifiedSince,
     IfNoneMatch, IfRange, IfUnmodifiedSince, LastModified, Range,
 };
-use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, StreamBody};
 use hyper::body::Frame;
 use hyper::{
     body::Incoming,
@@ -54,8 +54,31 @@ use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
 use xml::escape::escape_str_pcdata;
 
-pub type Request = hyper::Request<Incoming>;
+pub type Request<B = Incoming> = hyper::Request<B>;
 pub type Response = hyper::Response<BoxBody<Bytes, anyhow::Error>>;
+
+/// Request bodies the server can handle.
+///
+/// Network requests carry a hyper Incoming body; the tftp dispatcher
+/// constructs a request with an empty body. Both go through the same
+/// Server::handle implementation.
+pub trait MessageBody: hyper::body::Body<Data = Bytes> + Unpin + Send + 'static {}
+
+impl<T> MessageBody for T
+where
+    T: hyper::body::Body<Data = Bytes> + Unpin + Send + 'static,
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
+}
+
+/// Why a tftp request could not be turned into a static file response.
+#[derive(Debug)]
+pub(crate) enum TftpOpenError {
+    NotFound,
+    Forbidden,
+    Illegal,
+    Internal(anyhow::Error),
+}
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const INDEX_CSS: &str = include_str!("../assets/index.css");
@@ -181,11 +204,15 @@ impl Server {
         })
     }
 
-    pub async fn call(
+    pub async fn call<B>(
         self: Arc<Self>,
-        req: Request,
+        req: Request<B>,
         addr: Option<SocketAddr>,
-    ) -> Result<Response, hyper::Error> {
+    ) -> Result<Response, hyper::Error>
+    where
+        B: MessageBody,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         let uri = req.uri().clone();
         let assets_prefix = &self.assets_prefix;
         let enable_cors = self.args.enable_cors;
@@ -233,7 +260,11 @@ impl Server {
         Ok(res)
     }
 
-    pub async fn handle(self: Arc<Self>, req: Request, ip: Option<IpAddr>) -> Result<Response> {
+    pub async fn handle<B>(self: Arc<Self>, req: Request<B>, ip: Option<IpAddr>) -> Result<Response>
+    where
+        B: MessageBody,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         let mut res = Response::default();
 
         let req_path = req.uri().path().to_string();
@@ -841,14 +872,18 @@ impl Server {
         Ok(res)
     }
 
-    async fn handle_upload(
+    async fn handle_upload<B>(
         &self,
         path: &Path,
         upload_offset: Option<u64>,
         size: u64,
-        req: Request,
+        req: Request<B>,
         res: &mut Response,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        B: MessageBody,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         ensure_path_parent(path).await?;
         let (mut file, status) = match upload_offset {
             None => (fs::File::create(path).await?, StatusCode::CREATED),
@@ -1731,10 +1766,10 @@ impl Server {
         Ok(())
     }
 
-    async fn handle_copy(
+    async fn handle_copy<B>(
         &self,
         path: &Path,
-        req: &Request,
+        req: &Request<B>,
         ip: Option<IpAddr>,
         res: &mut Response,
     ) -> Result<()> {
@@ -1780,10 +1815,10 @@ impl Server {
         Ok(())
     }
 
-    async fn handle_move(
+    async fn handle_move<B>(
         &self,
         path: &Path,
-        req: &Request,
+        req: &Request<B>,
         ip: Option<IpAddr>,
         res: &mut Response,
     ) -> Result<()> {
@@ -2028,7 +2063,12 @@ impl Server {
     }
 
     /// Handle the OIDC login, callback and logout endpoints.
-    async fn handle_oidc(&self, oidc: &Oidc, action: &str, req: &Request) -> Result<Response> {
+    async fn handle_oidc<B>(
+        &self,
+        oidc: &Oidc,
+        action: &str,
+        req: &Request<B>,
+    ) -> Result<Response> {
         let mut res = Response::default();
         if req.method() != Method::GET && req.method() != Method::HEAD {
             *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
@@ -2182,9 +2222,9 @@ impl Server {
             .unwrap_or_default()
     }
 
-    async fn extract_dest(
+    async fn extract_dest<B>(
         &self,
-        req: &Request,
+        req: &Request<B>,
         ip: Option<IpAddr>,
         res: &mut Response,
     ) -> Option<PathBuf> {
@@ -2296,6 +2336,7 @@ impl Server {
         let ips = self.whitelist_snapshot();
         let data = serde_json::json!({
             "acl": acl.rules(),
+            "tftp": acl.tftp_rules(),
             "ips": ips.rules(),
         });
         let bytes = serde_json::to_vec(&data).unwrap_or_default();
@@ -2345,10 +2386,15 @@ impl Server {
 
     /// The user acl decision for a path relative to the serve root.
     async fn acl_perm(&self, path: &str, user: &str) -> Option<AclPerm> {
-        let perm = self
-            .user_acl_snapshot()
-            .perm(path, user, Some(&self.args.serve_path))
-            .await;
+        self.acl_perm_with(&self.user_acl_snapshot(), path, user)
+            .await
+    }
+
+    /// The user acl decision, evaluated against a specific snapshot. The acl
+    /// editor uses this to validate an edited rule before it is saved.
+    async fn acl_perm_with(&self, acl: &UserAcl, path: &str, user: &str) -> Option<AclPerm> {
+        let path = path.trim_matches('/');
+        let perm = acl.perm(path, user, Some(&self.args.serve_path)).await;
         // A traversal is the permission to walk *through* a directory, so it
         // must never apply to a file: a rule below a file path is a
         // misconfiguration, not a read grant.
@@ -2361,6 +2407,135 @@ impl Server {
             return Some(AclPerm::Deny);
         }
         perm
+    }
+
+    /// Whether the anonymous visitor may read a path, according to the
+    /// --auth tree, the per-path acl and, when oidc is active, the guest
+    /// identity. This mirrors the read side of handle; the ip whitelist is
+    /// deliberately not considered because it depends on the requesting
+    /// address, while this is a property of the acl editor.
+    async fn guest_can_read_with(&self, acl: &UserAcl, path: &str) -> bool {
+        let headers = HeaderMap::new();
+        let (_, access_paths, _) = if let Some(oidc) = &self.oidc {
+            self.guard_oidc(oidc, &headers, path, &Method::GET).await
+        } else {
+            self.args
+                .auth
+                .guard(path, &Method::GET, None, None, true, &self.args.serve_path)
+                .await
+        };
+        if access_paths.as_ref().is_some_and(|ap| ap.acl()) {
+            // x implies read, exactly like the http dispatcher.
+            return true;
+        }
+        match self.acl_perm_with(acl, path, "guest").await {
+            Some(AclPerm::Deny | AclPerm::Traverse) => false,
+            Some(AclPerm::Read | AclPerm::Write) => true,
+            // No acl rule covers the path, so --auth decides. An index-only
+            // grant may list a directory but cannot read a file from it.
+            None => access_paths.is_some_and(|ap| !ap.perm().indexonly()),
+        }
+    }
+
+    /// Whether tftp may serve a path: the path must have tftp enabled and its
+    /// content must be readable by guest. The actual request still goes
+    /// through handle, so the ip whitelist and every other check applies
+    /// again.
+    async fn tftp_allowed(&self, path: &str) -> bool {
+        let acl = self.user_acl_snapshot();
+        let (enabled, _) = acl.tftp_effective(path, Some(&self.args.serve_path)).await;
+        enabled && self.guest_can_read_with(&acl, path).await
+    }
+
+    /// Resolve a tftp file name into a static file response.
+    ///
+    /// The tftp name is relative to the served root. Only regular files that
+    /// the acl marks as tftp-enabled are served; dynamic endpoints, the
+    /// metadata directory and directory listings are rejected before the
+    /// request reaches handle.
+    pub(crate) async fn tftp_open(
+        self: Arc<Self>,
+        filename: &str,
+        client: SocketAddr,
+    ) -> Result<(Response, Option<u64>), TftpOpenError> {
+        if self.args.path_is_file {
+            return Err(TftpOpenError::Illegal);
+        }
+        let name = filename.trim_start_matches('/');
+        if name.is_empty() || name.contains('?') || name.contains('#') {
+            return Err(TftpOpenError::NotFound);
+        }
+        let uri_path = format!("{}{}", self.args.uri_prefix, encode_uri(name));
+        let relative = self
+            .resolve_path(&uri_path)
+            .ok_or(TftpOpenError::NotFound)?;
+        if relative.is_empty() {
+            return Err(TftpOpenError::NotFound);
+        }
+        // Internal endpoints are answered before auth by the http handler,
+        // and the metadata directory is never served. They are not static
+        // files, so a tftp request must not reach them.
+        let lower = relative.to_ascii_lowercase();
+        let metadata_dir = ip_whitelist_store::METADATA_DIR;
+        if lower == metadata_dir || lower.starts_with(&format!("{metadata_dir}/")) {
+            return Err(TftpOpenError::NotFound);
+        }
+        if relative == "favicon.ico"
+            || relative == HEALTH_CHECK_PATH
+            || relative == IP_WHITELIST_API_PATH
+            || relative == ACL_API_PATH
+            || relative.starts_with(OIDC_PREFIX)
+            || relative.starts_with(&self.assets_prefix)
+            || relative == self.assets_prefix.trim_end_matches('/')
+        {
+            return Err(TftpOpenError::NotFound);
+        }
+        let path = self.join_path(&relative).ok_or(TftpOpenError::NotFound)?;
+        if !fs::metadata(&path)
+            .await
+            .map(|meta| meta.is_file())
+            .unwrap_or_default()
+        {
+            return Err(TftpOpenError::NotFound);
+        }
+        if !self.tftp_allowed(&relative).await {
+            return Err(TftpOpenError::Forbidden);
+        }
+        let uri = uri_path
+            .parse::<Uri>()
+            .map_err(|_| TftpOpenError::NotFound)?;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Empty::<Bytes>::new())
+            .map_err(|_| TftpOpenError::Illegal)?;
+        let res = self
+            .handle(req, Some(client.ip()))
+            .await
+            .map_err(TftpOpenError::Internal)?;
+        let status = res.status();
+        if !status.is_success() {
+            return Err(match status {
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => TftpOpenError::Forbidden,
+                StatusCode::NOT_FOUND => TftpOpenError::NotFound,
+                _ if status.is_redirection() => TftpOpenError::Forbidden,
+                _ if status.is_server_error() => {
+                    TftpOpenError::Internal(anyhow!("backend status {status}"))
+                }
+                _ => TftpOpenError::Illegal,
+            });
+        }
+        // A directory listing, the spa fallback or a dynamic view can also
+        // return 200; only handle_send_file sets Content-Disposition.
+        if !res.headers().contains_key(CONTENT_DISPOSITION) {
+            return Err(TftpOpenError::NotFound);
+        }
+        let size = res
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        Ok((res, size))
     }
 
     /// Whether the user may write the parent directory of a path. This backs
@@ -2405,7 +2580,7 @@ impl Server {
 
     /// Whether the identity behind the request may write `path`, used for the
     /// destination of MOVE/COPY.
-    async fn dest_writable(&self, req: &Request, path: &str) -> bool {
+    async fn dest_writable<B>(&self, req: &Request<B>, path: &str) -> bool {
         let headers = req.headers();
         let (user, access_paths, _) = if let Some(oidc) = &self.oidc {
             self.guard_oidc(oidc, headers, path, req.method()).await
@@ -2478,7 +2653,11 @@ impl Server {
     }
 
     /// Read, replace or clear the persisted per-path ip whitelist.
-    async fn handle_ip_whitelist(&self, req: Request, method: Method) -> Result<Response> {
+    async fn handle_ip_whitelist<B>(&self, req: Request<B>, method: Method) -> Result<Response>
+    where
+        B: MessageBody,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         let mut res = Response::default();
 
         if self.args.path_is_file || !self.args.allow_ip_whitelist {
@@ -2604,7 +2783,11 @@ impl Server {
     }
 
     /// Combined read/write/deny-read acl for one path, editable from the WebUI.
-    async fn handle_acl(&self, req: Request, method: Method) -> Result<Response> {
+    async fn handle_acl<B>(&self, req: Request<B>, method: Method) -> Result<Response>
+    where
+        B: MessageBody,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         let mut res = Response::default();
 
         if self.args.path_is_file || !self.args.allow_ip_whitelist {
@@ -2664,23 +2847,17 @@ impl Server {
                     .find(&target, Some(&self.args.serve_path))
                     .await
                     .map(|v| v.iter().map(|v| v.to_string()).collect::<Vec<_>>());
-                let eff = self
-                    .user_acl_snapshot()
-                    .effective(&target, Some(&self.args.serve_path))
-                    .await;
+                let acl = self.user_acl_snapshot();
+                let eff = acl.effective(&target, Some(&self.args.serve_path)).await;
                 let x_users = self.args.auth.x_users(&target, &self.args.serve_path).await;
-                let chain = self
-                    .user_acl_snapshot()
-                    .chain(&target, Some(&self.args.serve_path))
+                let chain = acl.chain(&target, Some(&self.args.serve_path)).await;
+                let own = acl.own(&target, Some(&self.args.serve_path)).await;
+                let inherited = acl.inherited(&target, Some(&self.args.serve_path)).await;
+                let (enable_tftp, tftp_source) = acl
+                    .tftp_effective(&target, Some(&self.args.serve_path))
                     .await;
-                let own = self
-                    .user_acl_snapshot()
-                    .own(&target, Some(&self.args.serve_path))
-                    .await;
-                let inherited = self
-                    .user_acl_snapshot()
-                    .inherited(&target, Some(&self.args.serve_path))
-                    .await;
+                let own_enable_tftp = acl.tftp_own(&target, Some(&self.args.serve_path)).await;
+                let guest_readable = self.guest_can_read_with(&acl, &target).await;
                 let data = serde_json::json!({
                     "path": target,
                     "ips": ips,
@@ -2692,6 +2869,10 @@ impl Server {
                     "chain": chain,
                     "own": own,
                     "inherited": inherited,
+                    "enable_tftp": enable_tftp,
+                    "own_enable_tftp": own_enable_tftp,
+                    "tftp_source": tftp_source,
+                    "guest_readable": guest_readable,
                 });
                 let body = serde_json::to_string_pretty(&data)?;
                 res.headers_mut()
@@ -2721,6 +2902,9 @@ impl Server {
                     allow_write: Option<Vec<String>>,
                     #[serde(default)]
                     deny_read: Option<Vec<String>>,
+                    /// Absent means "leave the current switch unchanged".
+                    #[serde(default)]
+                    enable_tftp: Option<bool>,
                 }
                 let payload: AclPayload = match serde_json::from_slice(&bytes) {
                     Ok(v) => v,
@@ -2808,6 +2992,24 @@ impl Server {
                         deny_read,
                     },
                 );
+                // The switch is only meaningful for content guest can read.
+                // Evaluate it against the edited rule, so granting guest read
+                // and enabling tftp can happen in the same save.
+                let guest_readable = self.guest_can_read_with(&new_acl, &target).await;
+                if let Some(enabled) = payload.enable_tftp {
+                    if enabled && !guest_readable {
+                        status_bad_request(
+                            &mut res,
+                            "TFTP cannot be enabled because guest cannot read this path",
+                        );
+                        return Ok(res);
+                    }
+                    new_acl.set_tftp(&target, Some(enabled));
+                }
+                if !guest_readable {
+                    // Never leave the switch on for a path guest cannot read.
+                    new_acl.set_tftp(&target, Some(false));
+                }
                 if let Err(err) = ip_whitelist_store::save(&self.args.serve_path, &new_whitelist) {
                     error!("Failed to save acl, {err}");
                     *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
@@ -2836,7 +3038,7 @@ impl Server {
                 let mut new_whitelist = (*self.whitelist_snapshot()).clone();
                 new_whitelist.remove(&target);
                 let mut new_acl = (*self.user_acl_snapshot()).clone();
-                new_acl.remove(&target);
+                new_acl.remove_all(&target);
                 if let Err(err) = ip_whitelist_store::save(&self.args.serve_path, &new_whitelist) {
                     error!("Failed to save acl, {err}");
                     *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
