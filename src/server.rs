@@ -509,6 +509,13 @@ impl Server {
             return Ok(res);
         }
 
+        // TODO(virtual-file): dispatch a virtual file here. A virtual file has
+        // no file on disk; it only exists in .dufs/virtual-files.json and
+        // proxies every request to an upstream. It has to be handled after the
+        // acl and ip checks above, so it inherits the read/write rules of the
+        // path it pretends to be, and before the filesystem lookup below.
+        // Still to do: the .dufs store, the streaming proxy, the
+        // PathType::Virtual listing entry and the __dufs__/virtual-files api.
         if self.args.path_is_file {
             if self
                 .single_file_req_paths
