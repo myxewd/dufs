@@ -26,6 +26,7 @@ fn start_acl(tmpdir: &TempDir, port: &Port, guest: &str) -> Result<Child, Error>
         .arg("--auth")
         .arg("admin:admin@/:rwx")
         .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?)
 }
 
@@ -56,6 +57,7 @@ fn acl_controls_read_write_and_x(tmpdir: TempDir, port: Port) -> Result<(), Erro
         .arg("--auth")
         .arg("admin:admin@/:rwx")
         .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?;
     wait_for_port(&port);
 
@@ -272,7 +274,7 @@ fn acl_rules_follow_a_move(tmpdir: TempDir, port: Port) -> Result<(), Error> {
     )?;
     std::fs::write(
         tmpdir.path().join(".dufs/ip-whitelist.json"),
-        r#"{ "version": 1, "rules": { "/team/secret": ["127.0.0.1"] } }"#,
+        r#"{ "version": 1, "rules": { "/team/secret": ["127.0.0.1", "::1"] } }"#,
     )?;
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
         .arg(tmpdir.path())
@@ -287,6 +289,7 @@ fn acl_rules_follow_a_move(tmpdir: TempDir, port: Port) -> Result<(), Error> {
         .arg("--auth")
         .arg("admin:admin@/:rwx")
         .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?;
     wait_for_port(&port);
     let base = format!("http://localhost:{port}");
@@ -330,7 +333,7 @@ fn acl_rules_follow_a_move(tmpdir: TempDir, port: Port) -> Result<(), Error> {
     let ips: serde_json::Value = serde_json::from_str(&resp.text()?)?;
     assert_eq!(
         ips["rules"]["/team2/secret"],
-        serde_json::json!(["127.0.0.1"])
+        serde_json::json!(["127.0.0.1", "::1"])
     );
     assert!(ips["rules"]["/team/secret"].is_null());
 
@@ -393,6 +396,7 @@ fn acl_rules_are_dropped_with_the_content(tmpdir: TempDir, port: Port) -> Result
         .arg("--auth")
         .arg("admin:admin@/:rwx")
         .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?;
     wait_for_port(&port);
     let base = format!("http://localhost:{port}");
@@ -476,6 +480,7 @@ fn acl_traverse_works_without_ancestor_rules(tmpdir: TempDir, port: Port) -> Res
         .arg("--auth")
         .arg("admin:admin@/:rwx")
         .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?;
     wait_for_port(&port);
     let base = format!("http://localhost:{port}");
@@ -567,6 +572,7 @@ fn acl_traverse_with_render_index(tmpdir: TempDir, port: Port) -> Result<(), Err
         .arg("--auth")
         .arg("admin:admin@/:rwx")
         .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?;
     wait_for_port(&port);
     let base = format!("http://localhost:{port}");
@@ -635,6 +641,7 @@ fn acl_traverse_reaches_granted_child(tmpdir: TempDir, port: Port) -> Result<(),
         .arg("--auth")
         .arg("admin:admin@/:rwx")
         .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?;
     wait_for_port(&port);
     let base = format!("http://localhost:{port}");
@@ -856,6 +863,7 @@ fn admin_x_sees_acl_denied_entry(tmpdir: TempDir, port: Port) -> Result<(), Erro
         .arg("--auth")
         .arg("admin:admin@/:rwx")
         .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?;
     wait_for_port(&port);
     let base = format!("http://localhost:{port}");
@@ -920,6 +928,7 @@ fn admin_x_sees_ip_blocked_entry(tmpdir: TempDir, port: Port) -> Result<(), Erro
         .arg("--auth")
         .arg("admin:admin@/:rwx")
         .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?;
     wait_for_port(&port);
     let base = format!("http://localhost:{port}");

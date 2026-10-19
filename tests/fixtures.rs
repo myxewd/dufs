@@ -225,6 +225,7 @@ where
         .arg(port.to_string())
         .args(args.clone())
         .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .expect("Couldn't run test binary");
     let is_tls = args
@@ -309,6 +310,7 @@ where
         .arg("--tftp-bind")
         .arg("127.0.0.1")
         .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .expect("Couldn't run test binary");
     let is_tls = args

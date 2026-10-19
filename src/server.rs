@@ -368,6 +368,7 @@ impl Server {
                     query_params.get("token"),
                     is_microsoft_webdav,
                     &self.args.serve_path,
+                    Some(req.uri()),
                 )
                 .await
         };
@@ -388,8 +389,15 @@ impl Server {
                 return Ok(res);
             }
             // Authenticated: drop the `?login` marker and return to the
-            // page that started the login (the root for `/?login`).
-            redirect(&mut res, &req_path);
+            // page that started the login (the root for `/?login`). The raw
+            // path is not echoed blindly: a protocol-relative target such as
+            // `//evil.example` would turn this into an open redirect.
+            let location = if is_safe_local_target(&req_path) {
+                req_path.as_str()
+            } else {
+                self.args.uri_prefix.as_str()
+            };
+            redirect(&mut res, location);
             return Ok(res);
         }
 
@@ -487,7 +495,14 @@ impl Server {
         // directory, so a readable-but-unwritable parent cannot be bypassed.
         if (method == Method::DELETE || method.as_str() == "MOVE")
             && !self
-                .parent_writable(&relative_path, &acl_user, &method, authorization, headers)
+                .parent_writable(
+                    &relative_path,
+                    &acl_user,
+                    &method,
+                    authorization,
+                    headers,
+                    Some(req.uri()),
+                )
                 .await
         {
             status_forbid(&mut res);
@@ -597,9 +612,7 @@ impl Server {
         let render_spa = self.args.render_spa;
         let render_try_index = self.args.render_try_index;
 
-        if self.guard_root_contained(path).await
-            || (self.args.allow_symlink && self.guard_metadata_contained(path).await)
-        {
+        if self.guard_root_contained(path).await || self.is_metadata_contained(path).await {
             self.handle_not_found(&query_params, head_only, &mut res)
                 .await?;
             return Ok(res);
@@ -779,7 +792,9 @@ impl Server {
                 }
             }
             Method::DELETE => {
-                if !allow_delete {
+                // The served root is the anchor of the server (and holds the
+                // metadata directory); it must not be removable over http.
+                if relative_path.is_empty() || !allow_delete {
                     status_forbid(&mut res);
                 } else if !is_miss {
                     self.handle_delete(path, is_dir, &mut res).await?
@@ -790,13 +805,9 @@ impl Server {
             method => match method.as_str() {
                 "PROPFIND" => {
                     if is_dir {
-                        let access_paths =
-                            if access_paths.perm().indexonly() && authorization.is_none() {
-                                // see https://github.com/sigoden/dufs/issues/229
-                                AccessPaths::new(AccessPerm::ReadOnly)
-                            } else {
-                                access_paths
-                            };
+                        // Keep the index-only tree for filtering: widening it to
+                        // ReadOnly made every sibling entry visible to a guest
+                        // that only has a grant on one child.
                         let propfind_is_auth_x = access_paths.acl() && user.is_some();
                         self.handle_propfind_dir(
                             path,
@@ -841,7 +852,7 @@ impl Server {
                     }
                 }
                 "MOVE" => {
-                    if !allow_upload || !allow_delete {
+                    if relative_path.is_empty() || !allow_upload || !allow_delete {
                         status_forbid(&mut res);
                     } else if is_miss {
                         status_not_found(&mut res);
@@ -2156,10 +2167,20 @@ impl Server {
             self.cookie_path(),
             self.oidc_session_ttl_secs()
         );
-        if self.args.tls_cert.is_some() {
+        if self.cookie_secure() {
             value.push_str("; Secure");
         }
         HeaderValue::from_str(&value).unwrap_or_else(|_| HeaderValue::from_static(""))
+    }
+
+    /// Whether the OIDC session cookie must carry Secure. A deployment behind a
+    /// TLS-terminating proxy cannot be detected from here, so it can set
+    /// DUFS_OIDC_COOKIE_SECURE=true explicitly.
+    fn cookie_secure(&self) -> bool {
+        match self.oidc.as_ref().and_then(|oidc| oidc.cookie_secure()) {
+            Some(value) => value,
+            None => self.args.tls_cert.is_some(),
+        }
     }
 
     fn clear_session_cookie(&self) -> HeaderValue {
@@ -2167,7 +2188,7 @@ impl Server {
             "{SESSION_COOKIE}=; Path={}; HttpOnly; SameSite=Lax; Max-Age=0",
             self.cookie_path()
         );
-        if self.args.tls_cert.is_some() {
+        if self.cookie_secure() {
             value.push_str("; Secure");
         }
         HeaderValue::from_str(&value).unwrap_or_else(|_| HeaderValue::from_static(""))
@@ -2199,26 +2220,6 @@ impl Server {
             .await
             .ok()
             .map(|v| v.starts_with(&self.args.serve_path))
-            .unwrap_or_default()
-    }
-
-    /// Whether the path resolves into the metadata directory, following
-    /// symlinks even when they are otherwise allowed.
-    async fn guard_metadata_contained(&self, path: &Path) -> bool {
-        if self.args.path_is_file {
-            return false;
-        }
-        let metadata_dir = ip_whitelist_store::metadata_dir(&self.args.serve_path);
-        let mut check_path = path.to_path_buf();
-        while fs::symlink_metadata(&check_path).await.is_err() {
-            match check_path.parent() {
-                Some(parent) => check_path = parent.to_path_buf(),
-                None => return false,
-            }
-        }
-        fs::canonicalize(&check_path)
-            .await
-            .map(|v| v.starts_with(&metadata_dir))
             .unwrap_or_default()
     }
 
@@ -2261,6 +2262,14 @@ impl Server {
                 return None;
             }
         };
+
+        // The metadata directory is internal: a COPY/MOVE destination must not
+        // be able to overwrite the acl/whitelist store, not even under an alias
+        // (for example an NTFS 8.3 short name) or through a symlink.
+        if self.is_metadata_contained(&dest).await {
+            status_forbid(res);
+            return None;
+        }
 
         Some(dest)
     }
@@ -2421,7 +2430,15 @@ impl Server {
         } else {
             self.args
                 .auth
-                .guard(path, &Method::GET, None, None, true, &self.args.serve_path)
+                .guard(
+                    path,
+                    &Method::GET,
+                    None,
+                    None,
+                    true,
+                    &self.args.serve_path,
+                    None,
+                )
                 .await
         };
         if access_paths.as_ref().is_some_and(|ap| ap.acl()) {
@@ -2491,6 +2508,11 @@ impl Server {
             return Err(TftpOpenError::NotFound);
         }
         let path = self.join_path(&relative).ok_or(TftpOpenError::NotFound)?;
+        // The metadata check above is lexical; resolve aliases and symlinks too
+        // so tftp cannot read the stores under a different spelling.
+        if self.is_metadata_contained(&path).await {
+            return Err(TftpOpenError::NotFound);
+        }
         if !fs::metadata(&path)
             .await
             .map(|meta| meta.is_file())
@@ -2547,6 +2569,7 @@ impl Server {
         auth_method: &Method,
         authorization: Option<&HeaderValue>,
         headers: &HeaderMap<HeaderValue>,
+        request_uri: Option<&Uri>,
     ) -> bool {
         let parent = path
             .rsplit_once('/')
@@ -2565,6 +2588,7 @@ impl Server {
                     None,
                     false,
                     &self.args.serve_path,
+                    request_uri,
                 )
                 .await
         };
@@ -2594,6 +2618,7 @@ impl Server {
                     None,
                     false,
                     &self.args.serve_path,
+                    Some(req.uri()),
                 )
                 .await
         };
@@ -2642,14 +2667,49 @@ impl Server {
     }
 
     /// Whether a path resolves into the metadata directory.
+    ///
+    /// The check follows symlinks and filesystem aliases (for example NTFS 8.3
+    /// short names or trailing dots), so the metadata directory cannot be
+    /// reached under a different spelling. It is the only place that decides
+    /// whether a request may touch .dufs; the management api reads and writes
+    /// the stores directly instead of going through a request path.
     async fn is_metadata_contained(&self, path: &Path) -> bool {
         if self.args.path_is_file {
             return false;
         }
-        fs::canonicalize(path)
-            .await
-            .map(|v| v.starts_with(ip_whitelist_store::metadata_dir(&self.args.serve_path)))
-            .unwrap_or_default()
+        // Reject a path that names the directory directly even before the
+        // directory exists, so a COPY/PUT destination cannot create it and
+        // turn it into a store on the next start.
+        let relative = path.strip_prefix(&self.args.serve_path).unwrap_or(path);
+        if relative.components().any(|component| {
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(ip_whitelist_store::METADATA_DIR)
+        }) {
+            return true;
+        }
+        // When the directory does not exist there is nothing more to protect:
+        // no other spelling can resolve into it yet.
+        let Ok(metadata_dir) =
+            fs::canonicalize(ip_whitelist_store::metadata_dir(&self.args.serve_path)).await
+        else {
+            return false;
+        };
+        // Walk up to the first existing ancestor: canonicalize resolves every
+        // component, so an alias of the directory itself or a symlink leading
+        // into it is recognized. The target of a write may not exist yet; its
+        // parent is enough to decide.
+        let mut check = path.to_path_buf();
+        loop {
+            if let Ok(canonical) = fs::canonicalize(&check).await {
+                return canonical.starts_with(&metadata_dir);
+            }
+            match check.parent() {
+                Some(parent) if parent != check => check = parent.to_path_buf(),
+                _ => return false,
+            }
+        }
     }
 
     /// Read, replace or clear the persisted per-path ip whitelist.
@@ -2679,6 +2739,7 @@ impl Server {
                     None,
                     false,
                     &self.args.serve_path,
+                    Some(req.uri()),
                 )
                 .await
         };
@@ -2818,6 +2879,7 @@ impl Server {
                     None,
                     false,
                     &self.args.serve_path,
+                    Some(req.uri()),
                 )
                 .await
         };
@@ -3508,6 +3570,16 @@ fn status_forbid(res: &mut Response) {
 fn status_not_found(res: &mut Response) {
     *res.status_mut() = StatusCode::NOT_FOUND;
     *res.body_mut() = body_full("Not Found");
+}
+
+/// Whether a request target may be echoed verbatim as a same-host redirect.
+/// Protocol-relative targets (`//host`) and backslash variants are rejected
+/// because a browser would treat them as a different origin.
+fn is_safe_local_target(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.contains('\\')
+        && !path.chars().any(|c| c.is_control())
 }
 
 fn redirect(res: &mut Response, location: &str) {

@@ -37,9 +37,13 @@ impl HttpLogger {
                 LogElement::Variable(name) => match name.as_str() {
                     "request" | "request_method" | "request_uri" => {
                         let uri = req.uri().to_string();
-                        let decoded_uri = decode_uri(&uri)
-                            .map(|s| sanitize_log_value(&s))
-                            .unwrap_or_else(|| uri.clone());
+                        // A share token is a credential: never persist it in the
+                        // access log, which usually outlives the link and is
+                        // readable by more people than the shared file.
+                        let redacted = decode_uri(&uri)
+                            .map(|s| redact_token(&s))
+                            .unwrap_or_else(|| redact_token(&uri));
+                        let decoded_uri = sanitize_log_value(&redacted);
                         data.entry("request".to_string())
                             .or_insert_with(|| format!("{} {decoded_uri}", req.method()));
                         data.entry("request_method".to_string())
@@ -157,6 +161,27 @@ impl FromStr for HttpLogger {
         }
         Ok(Self { elements })
     }
+}
+
+/// Replace the value of a `token` query parameter with a placeholder so a
+/// share link cannot be lifted from the access log.
+fn redact_token(uri: &str) -> String {
+    let Some((path, query)) = uri.split_once('?') else {
+        return uri.to_string();
+    };
+    let query = query
+        .split('&')
+        .map(|part| {
+            let name = part.split_once('=').map(|(name, _)| name).unwrap_or(part);
+            if name == "token" {
+                "token=***".to_string()
+            } else {
+                part.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{path}?{query}")
 }
 
 fn sanitize_log_value(s: &str) -> String {

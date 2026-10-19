@@ -78,3 +78,30 @@ fn no_log(tmpdir: TempDir, port: Port, #[case] args: &[&str]) -> Result<(), Erro
     child.kill()?;
     Ok(())
 }
+
+#[rstest]
+fn log_redacts_share_tokens(tmpdir: TempDir, port: Port) -> Result<(), Error> {
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .arg("-p")
+        .arg(port.to_string())
+        .args(["--log-format", "$request"])
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    wait_for_port(&port);
+
+    let stdout = child.stdout.as_mut().expect("Failed to get stdout");
+    let resp = fetch!(b"GET", &format!("http://localhost:{port}/?token=deadbeef")).send()?;
+    assert_eq!(resp.status(), 200);
+
+    let mut buf = [0; 2048];
+    let buf_len = stdout.read(&mut buf)?;
+    let output = std::str::from_utf8(&buf[0..buf_len])?;
+    assert!(output.contains("token=***"), "{output}");
+    assert!(!output.contains("deadbeef"), "{output}");
+
+    child.kill()?;
+    Ok(())
+}
+

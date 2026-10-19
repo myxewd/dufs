@@ -2,6 +2,7 @@ mod digest_auth_util;
 mod fixtures;
 mod utils;
 
+use digest_auth::{AuthContext, HttpMethod};
 use digest_auth_util::send_with_digest_auth;
 use fixtures::{server, Error, TestServer};
 use indexmap::IndexSet;
@@ -337,8 +338,10 @@ fn no_auth_propfind_dir(
     let resp = fetch!(b"PROPFIND", server.url()).send()?;
     assert_eq!(resp.status(), 207);
     let body = resp.text()?;
+    // Only the entry the guest was granted is visible; the index-only root must
+    // not be widened to a full listing (that leaked every sibling name).
     assert!(body.contains("<D:href>/dir-assets/</D:href>"));
-    assert!(body.contains("<D:href>/dir1/</D:href>"));
+    assert!(!body.contains("<D:href>/dir1/</D:href>"));
     Ok(())
 }
 
@@ -687,3 +690,60 @@ fn guest_is_the_default_identity(
     assert_eq!(data["user"], "user");
     Ok(())
 }
+
+#[rstest]
+fn auth_digest_response_is_bound_to_the_request_uri(
+    #[with(&["--auth", "user:pass@/:ro"])] server: TestServer,
+) -> Result<(), Error> {
+    let url = format!("{}test.txt", server.url());
+    let first = fetch!(b"GET", &url).send()?;
+    assert_eq!(first.status(), 401);
+    let www = first
+        .headers()
+        .get("www-authenticate")
+        .unwrap()
+        .to_str()?
+        .to_string();
+    let header_for = |path: &str| -> Result<String, Error> {
+        let context =
+            AuthContext::new_with_method("user", "pass", path, None::<&[u8]>, HttpMethod::GET);
+        let mut prompt =
+            digest_auth::parse(&www).map_err(|err| format!("digest parse: {err}"))?;
+        let answer = prompt
+            .respond(&context)
+            .map_err(|err| format!("digest answer: {err}"))?;
+        Ok(answer.to_header_string())
+    };
+
+    // The response computed for the requested target is accepted.
+    let resp = fetch!(b"GET", &format!("{}index.html", server.url()))
+        .header("Authorization", header_for("/index.html")?)
+        .send()?;
+    assert_eq!(resp.status(), 200);
+
+    // The same credentials computed for another target are rejected there, so a
+    // captured Authorization header cannot be replayed for a different path.
+    let resp = fetch!(b"GET", &url)
+        .header("Authorization", header_for("/index.html")?)
+        .send()?;
+    assert_eq!(resp.status(), 401);
+    Ok(())
+}
+
+#[rstest]
+fn login_redirect_stays_on_the_same_host(
+    #[with(&["--auth", "user:pass@/:rw", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let resp = client
+        .get(format!("{}//evil.example/?login", server.url()))
+        .basic_auth("user", Some("pass"))
+        .send()?;
+    assert_eq!(resp.status(), 302);
+    let location = resp.headers().get("location").unwrap().to_str()?;
+    assert!(!location.starts_with("//"), "unsafe redirect: {location}");
+    Ok(())
+}
+

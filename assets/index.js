@@ -1878,7 +1878,7 @@ function formatPercent(percent) {
 }
 
 function encodedStr(rawStr) {
-  return rawStr.replace(/[\u00A0-\u9999<>\&]/g, function (i) {
+  return rawStr.replace(/[\u00A0-\u9999<>\&"']/g, function (i) {
     return '&#' + i.charCodeAt(0) + ';';
   });
 }

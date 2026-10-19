@@ -298,6 +298,7 @@ Dufs can delegate authentication to an OpenID Connect provider. Select the adapt
 | `DUFS_OIDC_SCOPES` | no | Space separated scopes [default: `openid profile email`] |
 | `DUFS_OIDC_USERNAME_CLAIM` | no | Claim used as the username [default: `preferred_username`] |
 | `DUFS_OIDC_SESSION_HOURS` | no | Session lifetime in hours [default: 168] |
+| `DUFS_OIDC_COOKIE_SECURE` | no | Force the `Secure` attribute on the session cookie (true/false); defaults to on when dufs itself serves TLS. Set it to true when TLS is terminated by a reverse proxy. |
 
 `DUFS_AUTH` still defines the permissions, keyed by the username returned by the provider. The password part of each rule is not used, so it can be any placeholder:
 
@@ -370,6 +371,8 @@ Editing the acl requires the `x` permission for the target path (and `--allow-ip
 dufs -a admin:pass@/:rwx -a alice:pass@/:ro --allow-ip-whitelist
 ```
 
+When no `--auth` rule is configured at all, content access stays open but the management api is closed: there is no identity that could own acl changes. Grant `x` explicitly to opt in, for example `-a '@/:x'` for anonymous management. Note that `x` can add the holder to `allow_write`, so it is effectively full control of that path.
+
 `x` users always win over the acl (they cannot be denied), but they are still limited by the ip whitelist. The backend rejects a save where the same user is both allowed and denied, where an `x` user is denied, or where the version is stale; `allow_write` users are added to `allow_read` automatically.
 
 #### Managing from the WebUI
@@ -378,10 +381,10 @@ Start dufs with `--allow-ip-whitelist` (or `-A`) and grant a user the `x` permis
 
 The list gets a `Whitelist` column: an empty list renders as `blocked` (nobody may access the path), a list containing `0.0.0.0/0` (or `::/0`) renders as blank (everyone may access it), and any other list shows its members. The editor pre-fills the whitelist that currently applies, so a path with no rule of its own shows `0.0.0.0/0` (everyone) and an empty input always means `blocked`. `Remove rule` drops the path's own rule so it inherits its closest configured parent again. Saving shows a diff of the affected users (before/after, the change types, and the acl rule chain) and asks for confirmation; a stale acl version is rejected with a conflict. The list also shows `Read` / `Write` columns: `alice` is a full grant, `(peter)` means a descendant denies the user, `[tom]` is an allow that only exists on a descendant, and `alice*` marks an `x` user; `guest` is shown as-is and full-write users (including `x` users) are omitted from the read column. The `Read` / `Write` columns are only shown to users with `x`, and a column without any entries is dropped. Long cells are truncated with `...` and open a full-list dialog; the dialog has a filter box, pressing Enter filters by the keyword (shown in the title), and pressing Enter on an empty box clears the filter. The summary is computed on demand from the in-memory rules (no separate index file); clicking a username does not open a per-user diff editor yet. The top-right Login button forces a fresh challenge even when the browser still holds guest credentials; after a successful login the `?login` marker is dropped and the page reloads without it. Only this button challenges: ordinary page and asset requests (including the plain `/favicon.ico`) never trigger a browser auth prompt. The management API accepts both Basic and Digest auth for reads and writes. The ip whitelist is the highest layer: a path the client address may not access is hidden even from an `x` user, while the management API itself stays available for fixing other paths. An `x` user still sees acl-denied entries in listings, search results and archives so they can manage them; for other callers, search results and archives only contain entries they may read, and the metadata dir is always excluded.
 
-Rules are stored in `<serve-path>/.dufs/ip-whitelist.json` and `<serve-path>/.dufs/user-acl.json`. The `.dufs` directory holds dufs metadata: it is never listed, downloaded, searched, archived or served, and it cannot be written to over HTTP.
+Rules are stored in `<serve-path>/.dufs/ip-whitelist.json` and `<serve-path>/.dufs/user-acl.json`. The `.dufs` directory holds dufs metadata: it is never listed, downloaded, searched, archived or served, and it cannot be written to over HTTP. The check is made on the resolved filesystem object, so aliases of the name (case variants, NTFS 8.3 short names, trailing dots), symlinks leading into it, and COPY/MOVE `Destination` headers are all refused. Only the management api reads and writes the stores, by their fixed paths.
 
 ```sh
-dufs --allow-ip-whitelist
+dufs --allow-ip-whitelist -a 'admin:pass@/:rwx'
 ```
 
 The stored file is authoritative. When management is enabled and no store exists yet, the `--ip-whitelist` rules seed it; a CLI-only run keeps those rules in memory instead. Delete `.dufs/ip-whitelist.json` to start over.

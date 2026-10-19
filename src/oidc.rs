@@ -16,6 +16,10 @@ use std::time::{Duration, Instant};
 pub const SESSION_COOKIE: &str = "dufs_oidc_session";
 
 const STATE_TTL: Duration = Duration::from_secs(600);
+/// Upper bound on logins that are waiting for their callback. Each login needs a
+/// state entry, so an unauthenticated flood must not be able to grow the map
+/// without bound.
+const MAX_PENDING_LOGINS: usize = 1024;
 
 /// The concrete endpoint state produced by `CoreProviderMetadata::discover`.
 type OidcClient = CoreClient<
@@ -38,6 +42,9 @@ pub struct OidcConfig {
     pub scopes: Vec<String>,
     pub username_claim: String,
     pub session_ttl: Duration,
+    /// Whether the session cookie carries the Secure attribute. None keeps the
+    /// historical behaviour (Secure only when dufs itself serves TLS).
+    pub cookie_secure: Option<bool>,
 }
 
 fn env_var(name: &str) -> Option<String> {
@@ -72,6 +79,13 @@ impl OidcConfig {
         let session_hours = env_var("DUFS_OIDC_SESSION_HOURS")
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(24 * 7);
+        let cookie_secure = env_var("DUFS_OIDC_COOKIE_SECURE").and_then(|value| {
+            match value.to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => Some(true),
+                "false" | "0" | "no" => Some(false),
+                _ => None,
+            }
+        });
         Ok(Self {
             issuer,
             client_id,
@@ -81,6 +95,7 @@ impl OidcConfig {
             scopes,
             username_claim,
             session_ttl: Duration::from_secs(session_hours.saturating_mul(3600)),
+            cookie_secure,
         })
     }
 }
@@ -130,6 +145,11 @@ impl Oidc {
 
     pub fn session_ttl(&self) -> Duration {
         self.config.session_ttl
+    }
+
+    /// Explicit cookie Secure preference; None keeps the built-in behaviour.
+    pub fn cookie_secure(&self) -> Option<bool> {
+        self.config.cookie_secure
     }
 
     async fn end_session_endpoint(&self) -> Result<Option<EndSessionUrl>> {
@@ -214,15 +234,22 @@ impl Oidc {
         }
         let (url, csrf, nonce) = request.url();
         let state = csrf.secret().to_string();
-        self.pending.lock().unwrap().insert(
-            state,
-            PendingLogin {
-                nonce: nonce.secret().to_string(),
-                pkce_verifier: verifier.secret().to_string(),
-                next: sanitize_next(next),
-                expires: Instant::now() + STATE_TTL,
-            },
-        );
+        {
+            let mut pending = self.pending.lock().unwrap();
+            pending.retain(|_, value| value.expires > Instant::now());
+            if pending.len() >= MAX_PENDING_LOGINS {
+                bail!("too many pending OIDC logins");
+            }
+            pending.insert(
+                state,
+                PendingLogin {
+                    nonce: nonce.secret().to_string(),
+                    pkce_verifier: verifier.secret().to_string(),
+                    next: sanitize_next(next),
+                    expires: Instant::now() + STATE_TTL,
+                },
+            );
+        }
         Ok(url.as_str().to_string())
     }
 

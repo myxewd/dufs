@@ -22,6 +22,7 @@ fn start_oidc(tmpdir: &TempDir, port: &Port, auth: &str) -> Result<std::process:
         .env("DUFS_OIDC_CLIENT_SECRET", "secret")
         .env("DUFS_OIDC_REDIRECT_URI", redirect)
         .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?)
 }
 

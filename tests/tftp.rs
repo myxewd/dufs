@@ -126,7 +126,7 @@ fn acl_put(
 
 #[rstest]
 fn tftp_serves_only_enabled_files(
-    #[with(&["--allow-all"])] tftp_server: TestServerTftp,
+    #[with(&["--allow-all", "-a", "@/:rwx"])] tftp_server: TestServerTftp,
 ) -> anyhow::Result<()> {
     // default: off
     let data = acl_get(&tftp_server, "/test.txt", None)?;
@@ -183,7 +183,7 @@ fn tftp_serves_only_enabled_files(
 
 #[rstest]
 fn tftp_only_save_does_not_create_an_acl_rule(
-    #[with(&["--allow-all"])] tftp_server: TestServerTftp,
+    #[with(&["--allow-all", "-a", "@/:rwx"])] tftp_server: TestServerTftp,
 ) -> anyhow::Result<()> {
     // This is the payload the WebUI sends when only the tftp switch changes
     // on a path without an own rule: no user lists, so no "deny everyone".
@@ -206,7 +206,7 @@ fn tftp_only_save_does_not_create_an_acl_rule(
 
 #[rstest]
 fn tftp_handles_non_ascii_names(
-    #[with(&["--allow-all"])] tftp_server: TestServerTftp,
+    #[with(&["--allow-all", "-a", "@/:rwx"])] tftp_server: TestServerTftp,
 ) -> anyhow::Result<()> {
     let resp = acl_put(
         &tftp_server,
@@ -223,7 +223,7 @@ fn tftp_handles_non_ascii_names(
 
 #[rstest]
 fn tftp_options_and_multiblock_file(
-    #[with(&["--allow-all"])] tftp_server: TestServerTftp,
+    #[with(&["--allow-all", "-a", "@/:rwx"])] tftp_server: TestServerTftp,
 ) -> anyhow::Result<()> {
     let content: Vec<u8> = (0..300_000).map(|index| (index % 251) as u8).collect();
     std::fs::write(tftp_server.path().join("big.bin"), &content)?;
@@ -291,7 +291,13 @@ fn tftp_requires_guest_read(
 
 #[rstest]
 fn tftp_respects_ip_whitelist(
-    #[with(&["--allow-all", "--ip-whitelist", "203.0.113.9@/test.txt"])]
+    #[with(&[
+        "--allow-all",
+        "-a",
+        "@/:rwx",
+        "--ip-whitelist",
+        "203.0.113.9@/test.txt",
+    ])]
     tftp_server: TestServerTftp,
 ) -> anyhow::Result<()> {
     // Omit ips so the initial whitelist is preserved.
@@ -309,7 +315,7 @@ fn tftp_respects_ip_whitelist(
 
 #[rstest]
 fn tftp_with_path_prefix(
-    #[with(&["--allow-all", "--path-prefix", "files"])] tftp_server: TestServerTftp,
+    #[with(&["--allow-all", "-a", "@/:rwx", "--path-prefix", "files"])] tftp_server: TestServerTftp,
 ) -> anyhow::Result<()> {
     // TestServer::url() points at the server root; the management api lives
     // below the configured path prefix.
@@ -329,7 +335,7 @@ fn tftp_with_path_prefix(
 
 #[rstest]
 fn tftp_delete_removes_the_switch(
-    #[with(&["--allow-all"])] tftp_server: TestServerTftp,
+    #[with(&["--allow-all", "-a", "@/:rwx"])] tftp_server: TestServerTftp,
 ) -> anyhow::Result<()> {
     let resp = acl_put(
         &tftp_server,

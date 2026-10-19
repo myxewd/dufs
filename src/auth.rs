@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{ed25519::signature::Signer, Signature, SigningKey};
 use headers::HeaderValue;
-use hyper::{header::WWW_AUTHENTICATE, Method};
+use hyper::{header::WWW_AUTHENTICATE, Method, Uri};
 use indexmap::IndexMap;
 use lazy_static::lazy_static;
 use md5::Context;
@@ -17,7 +17,7 @@ use std::{
 use uuid::Uuid;
 
 const REALM: &str = "DUFS";
-const DIGEST_AUTH_TIMEOUT: u32 = 60 * 60 * 24 * 7; // 7 days
+const DIGEST_AUTH_TIMEOUT: u32 = 60 * 60; // 1 hour
 const TOKEN_EXPIRATION: u64 = 1000 * 60 * 60 * 24 * 3; // 3 days
 
 lazy_static! {
@@ -43,7 +43,10 @@ impl Default for AccessControl {
             empty: true,
             use_hashed_password: false,
             users: IndexMap::new(),
-            anonymous: Some(AccessPaths::new_with_acl(AccessPerm::ReadWrite, true)),
+            // No x by default: without an --auth rule there is no identity that
+            // could be held responsible for acl changes. An administrator opts in
+            // explicitly with a rule such as `@/:rx`.
+            anonymous: Some(AccessPaths::new_with_acl(AccessPerm::ReadWrite, false)),
         }
     }
 }
@@ -159,6 +162,10 @@ impl AccessControl {
     /// true only when the identity was established by a share token rather than
     /// primary credentials or anonymous access. `root` is the served directory,
     /// used to resolve filesystem aliases of configured names.
+    ///
+    /// `request_uri` is the actual request target, used to bind a digest
+    /// response to the request it was computed for. Pass `None` only when no
+    /// request is involved (the header is then not accepted).
     pub async fn guard(
         &self,
         path: &str,
@@ -167,6 +174,7 @@ impl AccessControl {
         token: Option<&String>,
         guard_options: bool,
         root: &Path,
+        request_uri: Option<&Uri>,
     ) -> (Option<String>, Option<AccessPaths>, bool) {
         self.guard_with_auth_method(
             path,
@@ -176,6 +184,7 @@ impl AccessControl {
             token,
             guard_options,
             root,
+            request_uri,
         )
         .await
     }
@@ -194,11 +203,13 @@ impl AccessControl {
         token: Option<&String>,
         guard_options: bool,
         root: &Path,
+        request_uri: Option<&Uri>,
     ) -> (Option<String>, Option<AccessPaths>, bool) {
         if self.empty {
+            // Open content access, but no acl management: see AccessControl::default.
             return (
                 None,
-                Some(AccessPaths::new_with_acl(AccessPerm::ReadWrite, true)),
+                Some(AccessPaths::new_with_acl(AccessPerm::ReadWrite, false)),
                 false,
             );
         }
@@ -214,7 +225,9 @@ impl AccessControl {
         if let Some(authorization) = authorization {
             if let Some(user) = get_auth_user(authorization) {
                 if let Some((pass, ap)) = self.users.get(&user) {
-                    if check_auth(authorization, auth_method.as_str(), &user, pass).is_some() {
+                    if check_auth(authorization, auth_method.as_str(), &user, pass, request_uri)
+                        .is_some()
+                    {
                         if method == Method::OPTIONS {
                             return (
                                 Some(user),
@@ -624,6 +637,7 @@ pub fn check_auth(
     method: &str,
     auth_user: &str,
     auth_pass: &str,
+    request_uri: Option<&Uri>,
 ) -> Option<()> {
     if let Some(value) = strip_prefix(authorization.as_bytes(), b"Basic ") {
         let value: Vec<u8> = STANDARD.decode(value).ok()?;
@@ -662,6 +676,36 @@ pub fn check_auth(
                 return None;
             }
 
+            // The response must be bound to the request target. Otherwise a
+            // captured Authorization header can be replayed for any path for as
+            // long as the nonce is valid.
+            let uri = match (digest_map.get(b"uri".as_ref()), request_uri) {
+                (Some(uri), Some(request_uri)) => {
+                    let path_and_query = request_uri
+                        .path_and_query()
+                        .map(|value| value.as_str())
+                        .unwrap_or("");
+                    if *uri != path_and_query.as_bytes()
+                        && *uri != request_uri.to_string().as_bytes()
+                    {
+                        return None;
+                    }
+                    *uri
+                }
+                (Some(uri), None) => *uri,
+                // A digest response without a uri cannot be validated.
+                (None, _) => return None,
+            };
+
+            // The challenge advertises qop="auth"; requiring it keeps nc and
+            // cnonce in the hash and rejects the weaker RFC 2069 downgrade.
+            let qop = *digest_map.get(b"qop".as_ref())?;
+            let nc = *digest_map.get(b"nc".as_ref())?;
+            let cnonce = *digest_map.get(b"cnonce".as_ref())?;
+            if qop != &b"auth"[..] {
+                return None;
+            }
+
             let mut h = Context::new();
             h.consume(format!("{auth_user}:{REALM}:{auth_pass}").as_bytes());
             let auth_pass = format!("{:x}", h.finalize());
@@ -669,47 +713,22 @@ pub fn check_auth(
             let mut ha = Context::new();
             ha.consume(method);
             ha.consume(b":");
-            if let Some(uri) = digest_map.get(b"uri".as_ref()) {
-                ha.consume(uri);
-            }
+            ha.consume(uri);
             let ha = format!("{:x}", ha.finalize());
-            let mut correct_response = None;
-            if let Some(qop) = digest_map.get(b"qop".as_ref()) {
-                if qop == &b"auth".as_ref() || qop == &b"auth-int".as_ref() {
-                    correct_response = Some({
-                        let mut c = Context::new();
-                        c.consume(&auth_pass);
-                        c.consume(b":");
-                        c.consume(nonce);
-                        c.consume(b":");
-                        if let Some(nc) = digest_map.get(b"nc".as_ref()) {
-                            c.consume(nc);
-                        }
-                        c.consume(b":");
-                        if let Some(cnonce) = digest_map.get(b"cnonce".as_ref()) {
-                            c.consume(cnonce);
-                        }
-                        c.consume(b":");
-                        c.consume(qop);
-                        c.consume(b":");
-                        c.consume(&*ha);
-                        format!("{:x}", c.finalize())
-                    });
-                }
-            }
-            let correct_response = match correct_response {
-                Some(r) => r,
-                None => {
-                    let mut c = Context::new();
-                    c.consume(&auth_pass);
-                    c.consume(b":");
-                    c.consume(nonce);
-                    c.consume(b":");
-                    c.consume(&*ha);
-                    format!("{:x}", c.finalize())
-                }
-            };
-            if correct_response.as_bytes() == *user_response {
+
+            let mut c = Context::new();
+            c.consume(&auth_pass);
+            c.consume(b":");
+            c.consume(nonce);
+            c.consume(b":");
+            c.consume(nc);
+            c.consume(b":");
+            c.consume(cnonce);
+            c.consume(b":");
+            c.consume(qop);
+            c.consume(b":");
+            c.consume(&*ha);
+            if format!("{:x}", c.finalize()).as_bytes() == *user_response {
                 return Some(());
             }
         }
